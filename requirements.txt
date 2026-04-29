@@ -1,5 +1,5 @@
-# 주식 분석 시스템 의존성
-# 설치: pip install -r requirements.txt
+# Stock Analysis System dependencies
+# Install: pip install -r requirements.txt
 
 yfinance>=0.2.0
 finance-datareader>=0.9.50

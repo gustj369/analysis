@@ -22,7 +22,7 @@ env/
 
 # Local tool settings
 .claude/
-.git-codex/
+.git-permission-backup/
 
 # Generated dashboard outputs
 *_dashboard.html
