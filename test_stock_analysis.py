@@ -254,7 +254,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
     )
     @unittest.skipUnless(sa._yfinance_ok, "yfinance is not installed")
     def test_fetch_data_global_smoke(self):
-        df = sa.fetch_data("AAPL", start="2024-01-01", end="2024-02-01")
+        df = sa.fetch_data("AAPL", start="2024-01-01", end="2024-03-15")
 
         self.assertFalse(df.empty)
         self.assertEqual(
