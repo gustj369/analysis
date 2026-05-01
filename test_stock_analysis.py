@@ -1,5 +1,7 @@
 import os
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 import numpy as np
@@ -10,9 +12,15 @@ import stock_analysis as sa
 
 class StockAnalysisPureLogicTests(unittest.TestCase):
     @staticmethod
-    def _sample_price_frame(rows: int = 130) -> pd.DataFrame:
+    def _sample_price_frame(rows: int = 130,
+                            close: np.ndarray | None = None) -> pd.DataFrame:
         dates = pd.date_range("2024-01-01", periods=rows, freq="B")
-        close = np.linspace(100.0, 130.0, rows)
+        if close is None:
+            close = np.linspace(100.0, 130.0, rows)
+        else:
+            close = np.asarray(close, dtype=float)
+            rows = len(close)
+            dates = pd.date_range("2024-01-01", periods=rows, freq="B")
         return pd.DataFrame(
             {
                 "Open": close - 0.5,
@@ -91,6 +99,144 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertEqual(kwargs["ticker"], "BTC-USD")
         self.assertEqual(kwargs["period_years"], 1.0)
         self.assertFalse(kwargs["show_chart"])
+
+    def test_main_passes_explicit_cli_options(self):
+        argv = [
+            "stock_analysis.py",
+            "005930",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-03-01",
+            "--capital",
+            "5000000",
+            "--commission",
+            "0.001",
+            "--rfr",
+            "0.02",
+            "--overwrite",
+        ]
+
+        with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
+            sa.main()
+
+        run_mock.assert_called_once()
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["ticker"], "005930")
+        self.assertEqual(kwargs["start"], "2024-01-01")
+        self.assertEqual(kwargs["end"], "2024-03-01")
+        self.assertEqual(kwargs["initial_capital"], 5_000_000.0)
+        self.assertEqual(kwargs["commission"], 0.001)
+        self.assertEqual(kwargs["risk_free_rate"], 0.02)
+        self.assertTrue(kwargs["overwrite_html"])
+
+    def test_backtest_golden_cross_returns_expected_shape(self):
+        close = np.concatenate([
+            np.linspace(120.0, 80.0, 80),
+            np.linspace(81.0, 150.0, 80),
+        ])
+        df = sa.add_indicators(self._sample_price_frame(close=close))
+
+        result = sa.backtest_golden_cross(
+            df,
+            initial_capital=1_000_000,
+            commission=0.0,
+            risk_free_rate=0.0,
+            annualization_days=252,
+        )
+
+        expected_keys = {
+            "trades",
+            "equity_series",
+            "final_equity",
+            "total_return",
+            "annual_return",
+            "annual_vol",
+            "sharpe",
+            "mdd",
+            "n_trades",
+            "win_rate",
+            "initial_capital",
+        }
+        self.assertEqual(set(result.keys()), expected_keys)
+        self.assertEqual(len(result["equity_series"]), len(df))
+        self.assertGreaterEqual(result["n_trades"], 1)
+        self.assertGreater(result["final_equity"], 0)
+
+    def test_backtest_golden_cross_calculates_fixed_trade_result(self):
+        df = self._sample_price_frame(close=np.array([100.0, 100.0, 120.0]))
+        df["MA_Signal"] = ["", "golden", "dead"]
+
+        result = sa.backtest_golden_cross(
+            df,
+            initial_capital=1_000.0,
+            commission=0.0,
+            risk_free_rate=0.0,
+            annualization_days=252,
+        )
+
+        self.assertEqual(result["n_trades"], 1)
+        self.assertEqual(len(result["trades"]), 2)
+        self.assertEqual(result["final_equity"], 1_200.0)
+        self.assertAlmostEqual(result["total_return"], 0.2)
+        self.assertEqual(result["win_rate"], 1.0)
+
+    def test_backtest_buy_and_hold_returns_expected_shape(self):
+        df = self._sample_price_frame(close=np.array([100.0, 110.0, 120.0]))
+
+        result = sa.backtest_buy_and_hold(
+            df,
+            initial_capital=1_000_000,
+            commission=0.0,
+            risk_free_rate=0.0,
+            annualization_days=252,
+        )
+
+        self.assertEqual(result["initial_capital"], 1_000_000)
+        self.assertEqual(result["final_equity"], 1_200_000)
+        self.assertAlmostEqual(result["total_return"], 0.2)
+        self.assertIn("annual_return", result)
+        self.assertIn("mdd", result)
+
+    def test_backtest_buy_and_hold_applies_commission(self):
+        df = self._sample_price_frame(close=np.array([100.0, 120.0]))
+
+        result = sa.backtest_buy_and_hold(
+            df,
+            initial_capital=1_000.0,
+            commission=0.01,
+            risk_free_rate=0.0,
+            annualization_days=252,
+        )
+
+        self.assertAlmostEqual(result["final_equity"], 1_176.12)
+        self.assertAlmostEqual(result["total_return"], 0.17612)
+
+    def test_main_exits_when_run_analysis_reports_invalid_parameters(self):
+        argv = ["stock_analysis.py", "AAPL", "--capital", "-1", "--no-chart"]
+
+        with patch("sys.argv", argv), patch.object(
+            sa,
+            "run_analysis",
+            side_effect=ValueError("initial_capital은 0보다 커야 합니다."),
+        ):
+            stdout = StringIO()
+            with redirect_stdout(stdout), self.assertRaises(SystemExit) as cm:
+                sa.main()
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("[오류]", stdout.getvalue())
+
+    def test_main_exits_on_invalid_cli_type(self):
+        argv = ["stock_analysis.py", "AAPL", "--years", "not-a-number"]
+
+        with patch("sys.argv", argv):
+            stderr = StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as cm:
+                sa.main()
+
+        self.assertNotEqual(cm.exception.code, 0)
+        self.assertIn("invalid float value", stderr.getvalue())
 
     @unittest.skipUnless(sa._plotly_ok, "plotly is not installed")
     def test_plot_dashboard_returns_plotly_figure(self):

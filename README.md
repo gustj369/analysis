@@ -37,6 +37,18 @@ Run a specific ticker:
 python stock_analysis.py TSLA --years 3
 ```
 
+Run a Korean stock:
+
+```powershell
+python stock_analysis.py 005930 --years 2
+```
+
+Run a crypto asset:
+
+```powershell
+python stock_analysis.py BTC-USD --years 1
+```
+
 Run without generating a chart:
 
 ```powershell
@@ -49,6 +61,12 @@ Use explicit dates:
 python stock_analysis.py AAPL --start 2022-01-01 --end 2024-01-01
 ```
 
+Overwrite the dashboard HTML instead of using a timestamped filename:
+
+```powershell
+python stock_analysis.py AAPL --overwrite
+```
+
 ## Tests
 
 Run the network-free unit tests:
@@ -57,7 +75,8 @@ Run the network-free unit tests:
 python -m unittest -v
 ```
 
-By default, tests do not fetch live market data. To include the optional external data smoke test:
+By default, tests do not fetch live market data. This keeps everyday verification fast and deterministic.
+To include the optional external data smoke test:
 
 ```powershell
 $env:RUN_NETWORK_TESTS = "1"
@@ -79,7 +98,7 @@ If an automated environment cannot write to `.git` or cannot reach GitHub, run t
 
 ```powershell
 git add .gitignore README.md requirements.txt stock_analysis.py test_stock_analysis.py
-git commit -m "Add README and expanded tests"
+git commit -m "Add backtest tests and README examples"
 git push -u origin main
 ```
 

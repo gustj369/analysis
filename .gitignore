@@ -20,11 +20,11 @@ __pycache__/
 venv/
 env/
 
-# Local tool settings
+# Local tool settings and backup Git metadata
 .claude/
 .git-permission-backup/
 
-# Generated dashboard outputs
+# Generated dashboard outputs can be recreated from stock_analysis.py
 *_dashboard.html
 
 # OS/editor files
