@@ -21,6 +21,11 @@ import pandas as pd
 DEFAULT_BENCHMARKS = ("SPY", "QQQ")
 KOREA_BENCHMARKS = ("EWY", "SPY")
 CRYPTO_BENCHMARKS = ("BTC-USD", "ETH-USD")
+BENCHMARK_PRESETS = {
+    "us": DEFAULT_BENCHMARKS,
+    "korea": KOREA_BENCHMARKS,
+    "crypto": CRYPTO_BENCHMARKS,
+}
 
 # ── 의존성: import 실패를 None으로 보존 → 실행 시점에만 에러 발생 ──
 # (import 시점 sys.exit 제거 → 순수 함수 단위 테스트·부분 import 가능)
@@ -118,6 +123,17 @@ def _parse_benchmarks(value: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _positive_int(value: str) -> int:
+    """Parse a positive integer CLI value."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("value must be an integer")
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than 0")
+    return parsed
+
+
 def _default_benchmarks_for_ticker(ticker: str) -> tuple[str, ...]:
     """Choose a small default benchmark set by asset type."""
     normalized = ticker.strip().upper()
@@ -126,6 +142,23 @@ def _default_benchmarks_for_ticker(ticker: str) -> tuple[str, ...]:
     if normalized.endswith("-USD"):
         return tuple(item for item in CRYPTO_BENCHMARKS if item != normalized) or DEFAULT_BENCHMARKS
     return DEFAULT_BENCHMARKS
+
+
+def _select_benchmarks(ticker: str,
+                       benchmarks: tuple[str, ...] | None = None,
+                       preset: str = "auto") -> tuple[str, ...]:
+    """Resolve explicit benchmarks or an asset-class benchmark preset."""
+    if benchmarks:
+        return benchmarks
+    if preset == "off":
+        return ()
+    if preset == "auto":
+        selected = _default_benchmarks_for_ticker(ticker)
+    else:
+        selected = BENCHMARK_PRESETS[preset]
+
+    normalized = ticker.strip().upper()
+    return tuple(item for item in selected if item != normalized)
 
 
 def _make_html_path(ticker: str, overwrite: bool = False) -> Path:
@@ -250,6 +283,105 @@ def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
         raise ValueError(f"글로벌 주식 데이터 수집 실패 ({ticker}): {e}")
 
 
+def print_data_quality_check(ticker: str, df: pd.DataFrame) -> dict:
+    """Print a small data sanity check for sources that need extra interpretation."""
+    if not is_korean_ticker(ticker):
+        return {"checked": False, "reason": "not_korean_ticker"}
+
+    latest = df.iloc[-1]
+    close = float(latest["Close"])
+    adj_close = float(latest["Adj Close"])
+    ratio = adj_close / close if close else 0.0
+    min_close = float(df["Close"].min())
+    max_close = float(df["Close"].max())
+    median_close = float(df["Close"].median())
+    close_range_ratio = max_close / min_close if min_close else 0.0
+    latest_vs_median = close / median_close if median_close else 0.0
+    max_abs_daily_return = float(df["Close"].pct_change().abs().max(skipna=True) or 0.0)
+
+    print(f"[데이터 검증] {ticker} | 최근 종가 {close:,.0f} | 수정종가/종가 {ratio:.3f} | "
+          f"기간 종가 범위 {min_close:,.0f}~{max_close:,.0f}")
+    warnings = []
+    if abs(ratio - 1.0) > 0.01:
+        warnings.append("adjusted_close_diff")
+        print("[경고] 수정종가와 종가 차이가 큽니다. 액면분할/배당 조정 여부를 확인하세요.")
+    if close_range_ratio >= 4.0:
+        warnings.append("wide_close_range")
+        print(f"[경고] 기간 중 종가 범위가 넓습니다 ({close_range_ratio:.2f}배). 액면분할/거래정지/데이터 원천을 확인하세요.")
+    if latest_vs_median >= 3.0 or latest_vs_median <= 0.33:
+        warnings.append("latest_close_outlier")
+        print(f"[경고] 최근 종가가 기간 중앙값과 크게 다릅니다 ({latest_vs_median:.2f}배). 최신 원천 데이터를 확인하세요.")
+    if max_abs_daily_return > 0.35:
+        warnings.append("large_daily_move")
+        print(f"[경고] 일간 종가 변동률이 비정상적으로 큽니다 ({max_abs_daily_return*100:.2f}%). 원천 데이터 이상 여부를 확인하세요.")
+
+    return {
+        "checked": True,
+        "ticker": ticker,
+        "latest_close": close,
+        "latest_adj_close": adj_close,
+        "adj_close_ratio": ratio,
+        "min_close": min_close,
+        "max_close": max_close,
+        "close_range_ratio": close_range_ratio,
+        "latest_vs_median": latest_vs_median,
+        "max_abs_daily_return": max_abs_daily_return,
+        "warning": warnings[0] if warnings else None,
+        "warnings": warnings,
+    }
+
+
+def print_external_price_check(ticker: str, df: pd.DataFrame) -> dict:
+    """Compare Korean stock source prices with a yfinance reference when possible."""
+    if not is_korean_ticker(ticker):
+        return {"checked": False, "reason": "not_korean_ticker"}
+    if not _yfinance_ok:
+        print("[외부 기준 가격] yfinance 미설치로 비교를 건너뜁니다.")
+        return {"checked": False, "reason": "yfinance_not_installed"}
+
+    start = df.index[max(len(df) - 10, 0)].strftime("%Y-%m-%d")
+    end = (df.index[-1] + timedelta(days=2)).strftime("%Y-%m-%d")
+    reference_df = None
+    reference_ticker = None
+    failures = {}
+
+    for suffix in (".KS", ".KQ"):
+        candidate = f"{ticker}{suffix}"
+        try:
+            reference_df = _normalize_columns(_fetch_global(candidate, start, end)).ffill().dropna()
+            reference_ticker = candidate
+            break
+        except Exception as exc:
+            failures[candidate] = str(exc)
+            continue
+
+    if reference_df is None or reference_df.empty:
+        reason = "; ".join(f"{key}: {value}" for key, value in failures.items()) or "no data"
+        print(f"[외부 기준 가격] yfinance .KS/.KQ 기준 가격을 찾지 못했습니다. 사유: {reason}")
+        return {"checked": False, "reason": "reference_not_found", "failures": failures}
+
+    local_close = float(df["Close"].iloc[-1])
+    ref_close = float(reference_df["Close"].iloc[-1])
+    diff_pct = (local_close / ref_close - 1) * 100 if ref_close else 0.0
+    print(f"[외부 기준 가격] FDR {ticker} {local_close:,.0f} | "
+          f"yfinance {reference_ticker} {ref_close:,.0f} | 차이 {diff_pct:+.2f}%")
+    warning = None
+    if abs(diff_pct) > 1.0:
+        warning = "reference_price_diff"
+        print("[경고] 원천 데이터와 외부 기준 가격 차이가 큽니다. 종목 매핑/수정주가를 확인하세요.")
+
+    return {
+        "checked": True,
+        "ticker": ticker,
+        "reference_ticker": reference_ticker,
+        "local_close": local_close,
+        "reference_close": ref_close,
+        "diff_pct": diff_pct,
+        "warning": warning,
+        "failures": failures,
+    }
+
+
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """컬럼명을 표준 형식으로 통일."""
     rename_map = {}
@@ -364,7 +496,8 @@ def compute_benchmark_comparison(target_stats: dict,
                                  end: str,
                                  risk_free_rate: float = 0.03,
                                  annualization_days: int = 252,
-                                 benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS) -> list[dict]:
+                                 benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS,
+                                 corr_window: int = 60) -> list[dict]:
     """
     Compare target return metrics with simple market benchmarks.
 
@@ -372,6 +505,8 @@ def compute_benchmark_comparison(target_stats: dict,
     can continue even when an external data source is temporarily unavailable.
     """
     target_total_return = float(target_stats["cumulative_return"].iloc[-1] - 1)
+    target_cum = target_stats["cumulative_return"]
+    target_daily = target_stats["daily_return"]
     rows: list[dict] = []
 
     for benchmark in benchmarks:
@@ -383,6 +518,17 @@ def compute_benchmark_comparison(target_stats: dict,
                 annualization_days=annualization_days,
             )
             total_return = float(bm_stats["cumulative_return"].iloc[-1] - 1)
+            aligned_cum = pd.concat(
+                [target_cum.rename("target"), bm_stats["cumulative_return"].rename("benchmark")],
+                axis=1,
+            ).ffill().dropna()
+            excess_return_series = aligned_cum["target"] - aligned_cum["benchmark"]
+            aligned_daily = pd.concat(
+                [target_daily.rename("target"), bm_stats["daily_return"].rename("benchmark")],
+                axis=1,
+            ).dropna()
+            rolling_corr = aligned_daily["target"].rolling(corr_window).corr(aligned_daily["benchmark"])
+            latest_corr = rolling_corr.dropna().iloc[-1] if not rolling_corr.dropna().empty else None
             rows.append({
                 "ticker": benchmark,
                 "total_return": total_return,
@@ -390,6 +536,10 @@ def compute_benchmark_comparison(target_stats: dict,
                 "mdd": float(bm_stats["mdd"]),
                 "excess_return": target_total_return - total_return,
                 "cumulative_return": bm_stats["cumulative_return"],
+                "excess_return_series": excess_return_series,
+                "rolling_corr": rolling_corr,
+                "corr_window": corr_window,
+                "latest_corr": None if latest_corr is None else float(latest_corr),
                 "error": None,
             })
         except Exception as exc:
@@ -400,6 +550,10 @@ def compute_benchmark_comparison(target_stats: dict,
                 "mdd": None,
                 "excess_return": None,
                 "cumulative_return": None,
+                "excess_return_series": None,
+                "rolling_corr": None,
+                "corr_window": corr_window,
+                "latest_corr": None,
                 "error": str(exc),
             })
 
@@ -429,6 +583,8 @@ def print_benchmark_report(ticker: str, target_stats: dict, benchmark_rows: list
               f"{row['annual_return']*100:>9.2f}% "
               f"{row['mdd']*100:>9.2f}% "
               f"{row['excess_return']*100:>+9.2f}%")
+        corr_text = "N/A" if row["latest_corr"] is None else f"{row['latest_corr']:.2f}"
+        print(f"    {row['corr_window']}D rolling correlation: {corr_text}")
 
 
 def compute_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
@@ -632,7 +788,10 @@ def _format_benchmark_annotation(benchmark_rows: list[dict] | None) -> str | Non
         if row.get("error"):
             parts.append(f"{row['ticker']} N/A")
         else:
-            parts.append(f"{row['ticker']} 초과 {row['excess_return']*100:+.2f}%")
+            corr = row.get("latest_corr")
+            corr_text = "N/A" if corr is None else f"{corr:.2f}"
+            corr_window = row.get("corr_window", 60)
+            parts.append(f"{row['ticker']} 초과 {row['excess_return']*100:+.2f}% / {corr_window}D상관 {corr_text}")
 
     return "<b>벤치마크</b>: " + " | ".join(parts)
 
@@ -641,7 +800,10 @@ def plot_dashboard(df: pd.DataFrame,
                    ticker: str,
                    stats: dict,
                    current_state: dict | None = None,
-                   benchmark_comparison: list[dict] | None = None):
+                   benchmark_comparison: list[dict] | None = None,
+                   show_excess_return: bool = True,
+                   benchmark_display: str = "all",
+                   show_marker_legend: bool = True):
     """
     Plotly 서브플롯 대시보드 (캔들 + MA, 거래량, RSI, MACD).
     """
@@ -692,13 +854,15 @@ def plot_dashboard(df: pd.DataFrame,
         fig.add_trace(go.Scatter(
             x=golden.index, y=golden["MA20"],
             mode="markers", marker=dict(symbol="triangle-up", size=12, color="#00E676"),
-            name="골든크로스"
+            name="골든크로스",
+            showlegend=show_marker_legend,
         ), row=1, col=1)
     if not dead.empty:
         fig.add_trace(go.Scatter(
             x=dead.index, y=dead["MA20"],
             mode="markers", marker=dict(symbol="triangle-down", size=12, color="#FF1744"),
-            name="데드크로스"
+            name="데드크로스",
+            showlegend=show_marker_legend,
         ), row=1, col=1)
 
     # ── 차트2: 거래량 ──
@@ -727,13 +891,15 @@ def plot_dashboard(df: pd.DataFrame,
         fig.add_trace(go.Scatter(
             x=rsi_buy.index, y=rsi_buy["RSI"],
             mode="markers", marker=dict(symbol="triangle-up", size=10, color="#00BCD4"),
-            name="RSI 매수"
+            name="RSI 매수",
+            showlegend=show_marker_legend,
         ), row=3, col=1)
     if not rsi_sell.empty:
         fig.add_trace(go.Scatter(
             x=rsi_sell.index, y=rsi_sell["RSI"],
             mode="markers", marker=dict(symbol="triangle-down", size=10, color="#E91E63"),
-            name="RSI 매도"
+            name="RSI 매도",
+            showlegend=show_marker_legend,
         ), row=3, col=1)
 
     # ── 차트4: MACD ──
@@ -760,35 +926,51 @@ def plot_dashboard(df: pd.DataFrame,
         fig.add_trace(go.Scatter(
             x=macd_golden.index, y=macd_golden["MACD"],
             mode="markers", marker=dict(symbol="triangle-up", size=10, color="#00E676"),
-            name="MACD 골든"
+            name="MACD 골든",
+            showlegend=show_marker_legend,
         ), row=4, col=1)
     if not macd_dead.empty:
         fig.add_trace(go.Scatter(
             x=macd_dead.index, y=macd_dead["MACD"],
             mode="markers", marker=dict(symbol="triangle-down", size=10, color="#FF1744"),
-            name="MACD 데드"
+            name="MACD 데드",
+            showlegend=show_marker_legend,
         ), row=4, col=1)
 
     # ── 레이아웃 ──
     target_cum_pct = (stats["cumulative_return"] - 1) * 100
-    fig.add_trace(go.Scatter(
-        x=target_cum_pct.index,
-        y=target_cum_pct,
-        name=f"{ticker} 누적수익률",
-        line=dict(color="#FFFFFF", width=2.0),
-    ), row=5, col=1)
+    show_cumulative_lines = benchmark_display in ("all", "cumulative")
+    show_excess_lines = show_excess_return and benchmark_display in ("all", "excess")
+    if show_cumulative_lines:
+        fig.add_trace(go.Scatter(
+            x=target_cum_pct.index,
+            y=target_cum_pct,
+            name=f"{ticker} 누적수익률",
+            line=dict(color="#FFFFFF", width=2.0),
+        ), row=5, col=1)
 
     benchmark_colors = ["#00BCD4", "#FFD54F", "#A5D6A7", "#CE93D8"]
     for idx, row in enumerate(benchmark_comparison or []):
         series = row.get("cumulative_return")
         if row.get("error") or series is None:
             continue
-        fig.add_trace(go.Scatter(
-            x=series.index,
-            y=(series - 1) * 100,
-            name=f"{row['ticker']} 누적수익률",
-            line=dict(color=benchmark_colors[idx % len(benchmark_colors)], width=1.5, dash="dot"),
-        ), row=5, col=1)
+        if show_cumulative_lines:
+            fig.add_trace(go.Scatter(
+                x=series.index,
+                y=(series - 1) * 100,
+                name=f"{row['ticker']} 누적수익률",
+                line=dict(color=benchmark_colors[idx % len(benchmark_colors)], width=1.5, dash="dot"),
+            ), row=5, col=1)
+
+        excess_series = row.get("excess_return_series")
+        if show_excess_lines and excess_series is not None:
+            fig.add_trace(go.Scatter(
+                x=excess_series.index,
+                y=excess_series * 100,
+                name=f"{ticker} vs {row['ticker']} 초과수익",
+                line=dict(color=benchmark_colors[idx % len(benchmark_colors)], width=1.2, dash="dash"),
+                opacity=0.75,
+            ), row=5, col=1)
 
     annual_ret_pct = stats["annual_return"]    * 100
     annual_vol_pct = stats["annual_volatility"] * 100
@@ -1116,7 +1298,12 @@ def run_analysis(ticker: str,
                  risk_free_rate: float = 0.03,
                  show_chart: bool = True,
                  overwrite_html: bool = False,
-                 benchmarks: tuple[str, ...] | None = None) -> dict:
+                 benchmarks: tuple[str, ...] | None = None,
+                 benchmark_preset: str = "auto",
+                 show_excess_return: bool = True,
+                 benchmark_display: str = "all",
+                 corr_window: int = 60,
+                 show_marker_legend: bool = True) -> dict:
     """
     전체 분석 파이프라인 실행.
 
@@ -1146,6 +1333,8 @@ def run_analysis(ticker: str,
 
     # 1. 데이터 수집
     df = fetch_data(ticker, period_years=period_years, start=start, end=end)
+    data_quality = print_data_quality_check(ticker, df)
+    external_price_check = print_external_price_check(ticker, df)
 
     # 2. 자산 유형별 연환산 기준 자동 결정
     ann_days = _detect_annualization_days(df)
@@ -1165,7 +1354,7 @@ def run_analysis(ticker: str,
     current_state = summarize_current_state(df)
     print_current_state(current_state, ticker)
 
-    selected_benchmarks = benchmarks or _default_benchmarks_for_ticker(ticker)
+    selected_benchmarks = _select_benchmarks(ticker, benchmarks, benchmark_preset)
     benchmark_start = df.index[0].strftime("%Y-%m-%d")
     benchmark_end = (df.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
     benchmark_comparison = compute_benchmark_comparison(
@@ -1175,13 +1364,17 @@ def run_analysis(ticker: str,
         risk_free_rate=risk_free_rate,
         annualization_days=ann_days,
         benchmarks=selected_benchmarks,
+        corr_window=corr_window,
     )
     print_benchmark_report(ticker, stats, benchmark_comparison)
 
     # 6. 시각화
     if show_chart:
         fig      = plot_dashboard(df, ticker, stats, current_state=current_state,
-                                  benchmark_comparison=benchmark_comparison)
+                                  benchmark_comparison=benchmark_comparison,
+                                  show_excess_return=show_excess_return,
+                                  benchmark_display=benchmark_display,
+                                  show_marker_legend=show_marker_legend)
         out_path = _make_html_path(ticker, overwrite=overwrite_html)
         fig.write_html(out_path)
         print(f"[차트 저장] {out_path}")
@@ -1204,7 +1397,9 @@ def run_analysis(ticker: str,
             "bt_result": bt_result, "bah_result": bah_result,
             "annualization_days": ann_days,
             "current_state": current_state,
-            "benchmark_comparison": benchmark_comparison}
+            "benchmark_comparison": benchmark_comparison,
+            "data_quality": data_quality,
+            "external_price_check": external_price_check}
 
 
 # ──────────────────────────────────────────────
@@ -1286,6 +1481,29 @@ def main() -> None:
         metavar="A,B",
         help="benchmark tickers separated by commas (default: auto by asset type)"
     )
+    parser.add_argument(
+        "--benchmark-preset", choices=("auto", "us", "korea", "crypto", "off"),
+        default="auto",
+        help="benchmark preset to use when --benchmarks is not provided"
+    )
+    parser.add_argument(
+        "--no-excess-line", action="store_true",
+        help="hide benchmark excess-return lines in the dashboard"
+    )
+    parser.add_argument(
+        "--benchmark-display", choices=("all", "cumulative", "excess"),
+        default="all",
+        help="benchmark panel line mode: all, cumulative, or excess"
+    )
+    parser.add_argument(
+        "--corr-window", type=_positive_int, default=60,
+        metavar="N",
+        help="rolling correlation window in trading days (default: 60)"
+    )
+    parser.add_argument(
+        "--hide-marker-legend", action="store_true",
+        help="hide auxiliary signal marker entries from the dashboard legend"
+    )
 
     args = parser.parse_args()
 
@@ -1301,6 +1519,11 @@ def main() -> None:
             show_chart=not args.no_chart,
             overwrite_html=args.overwrite,
             benchmarks=args.benchmarks,
+            benchmark_preset=args.benchmark_preset,
+            show_excess_return=not args.no_excess_line,
+            benchmark_display=args.benchmark_display,
+            corr_window=args.corr_window,
+            show_marker_legend=not args.hide_marker_legend,
         )
     except (ValueError, ImportError) as e:
         print(f"\n[오류] {e}")

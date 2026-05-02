@@ -130,6 +130,14 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "--overwrite",
             "--benchmarks",
             "VTI,QQQ",
+            "--benchmark-preset",
+            "crypto",
+            "--no-excess-line",
+            "--benchmark-display",
+            "excess",
+            "--corr-window",
+            "30",
+            "--hide-marker-legend",
         ]
 
         with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
@@ -145,6 +153,11 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertEqual(kwargs["risk_free_rate"], 0.02)
         self.assertTrue(kwargs["overwrite_html"])
         self.assertEqual(kwargs["benchmarks"], ("VTI", "QQQ"))
+        self.assertEqual(kwargs["benchmark_preset"], "crypto")
+        self.assertFalse(kwargs["show_excess_return"])
+        self.assertEqual(kwargs["benchmark_display"], "excess")
+        self.assertEqual(kwargs["corr_window"], 30)
+        self.assertFalse(kwargs["show_marker_legend"])
 
     def test_run_analysis_includes_current_state_summary(self):
         df = self._sample_price_frame()
@@ -160,6 +173,8 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
 
         self.assertIn("current_state", result)
         self.assertIn("benchmark_comparison", result)
+        self.assertIn("data_quality", result)
+        self.assertIn("external_price_check", result)
         self.assertEqual(result["current_state"]["trend"], "상승 우위")
         self.assertEqual(result["current_state"]["signal_score_max"], 5)
         self.assertEqual([row["ticker"] for row in result["benchmark_comparison"]], ["SPY", "QQQ"])
@@ -177,6 +192,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
                 risk_free_rate=0.0,
                 annualization_days=252,
                 benchmarks=("SPY",),
+                corr_window=2,
             )
 
         self.assertEqual(len(rows), 1)
@@ -185,6 +201,10 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["total_return"], 0.10)
         self.assertAlmostEqual(rows[0]["excess_return"], 0.10)
         self.assertIn("cumulative_return", rows[0])
+        self.assertIn("excess_return_series", rows[0])
+        self.assertIn("rolling_corr", rows[0])
+        self.assertIn("latest_corr", rows[0])
+        self.assertEqual(rows[0]["corr_window"], 2)
 
     def test_compute_benchmark_comparison_keeps_fetch_errors(self):
         target_df = self._sample_price_frame(close=np.array([100.0, 120.0]))
@@ -207,6 +227,70 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertEqual(sa._default_benchmarks_for_ticker("AAPL"), ("SPY", "QQQ"))
         self.assertEqual(sa._default_benchmarks_for_ticker("005930"), ("EWY", "SPY"))
         self.assertEqual(sa._default_benchmarks_for_ticker("BTC-USD"), ("ETH-USD",))
+        self.assertEqual(sa._select_benchmarks("ETH-USD", preset="crypto"), ("BTC-USD",))
+        self.assertEqual(sa._select_benchmarks("AAPL", preset="off"), ())
+
+    def test_print_data_quality_check_reports_korean_stock_source(self):
+        df = self._sample_price_frame(close=np.array([100.0, 110.0, 120.0]))
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            result = sa.print_data_quality_check("005930", df)
+
+        output = stdout.getvalue()
+        self.assertTrue(result["checked"])
+        self.assertEqual(result["ticker"], "005930")
+        self.assertEqual(result["latest_close"], 120.0)
+        self.assertEqual(result["warnings"], [])
+        self.assertIn("close_range_ratio", result)
+        self.assertIn("max_abs_daily_return", result)
+        self.assertIn("데이터 검증", output)
+        self.assertIn("005930", output)
+
+    def test_print_data_quality_check_flags_unusual_korean_price_moves(self):
+        df = self._sample_price_frame(close=np.array([100.0, 105.0, 600.0]))
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            result = sa.print_data_quality_check("005930", df)
+
+        self.assertIn("wide_close_range", result["warnings"])
+        self.assertIn("latest_close_outlier", result["warnings"])
+        self.assertIn("large_daily_move", result["warnings"])
+        self.assertIn("경고", stdout.getvalue())
+
+    def test_print_external_price_check_compares_yfinance_reference(self):
+        df = self._sample_price_frame(close=np.array([100.0, 110.0, 120.0]))
+        ref_df = self._sample_price_frame(close=np.array([100.0, 110.0, 121.0]))
+
+        stdout = StringIO()
+        with patch.object(sa, "_yfinance_ok", True), patch.object(
+            sa, "_fetch_global", return_value=ref_df
+        ), redirect_stdout(stdout):
+            result = sa.print_external_price_check("005930", df)
+
+        output = stdout.getvalue()
+        self.assertTrue(result["checked"])
+        self.assertEqual(result["reference_ticker"], "005930.KS")
+        self.assertAlmostEqual(result["diff_pct"], (120.0 / 121.0 - 1) * 100)
+        self.assertIn("외부 기준 가격", output)
+        self.assertIn("005930.KS", output)
+
+    def test_print_external_price_check_reports_reference_failures(self):
+        df = self._sample_price_frame(close=np.array([100.0, 110.0, 120.0]))
+
+        stdout = StringIO()
+        with patch.object(sa, "_yfinance_ok", True), patch.object(
+            sa, "_fetch_global", side_effect=ValueError("no reference data")
+        ), redirect_stdout(stdout):
+            result = sa.print_external_price_check("005930", df)
+
+        output = stdout.getvalue()
+        self.assertFalse(result["checked"])
+        self.assertEqual(result["reason"], "reference_not_found")
+        self.assertIn("005930.KS", result["failures"])
+        self.assertIn("005930.KQ", result["failures"])
+        self.assertIn("사유", output)
 
     def test_backtest_golden_cross_returns_expected_shape(self):
         close = np.concatenate([
@@ -329,6 +413,10 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "mdd": -0.05,
             "excess_return": 0.03,
             "cumulative_return": stats["cumulative_return"],
+            "excess_return_series": stats["cumulative_return"] - stats["cumulative_return"],
+            "rolling_corr": stats["daily_return"].rolling(60).corr(stats["daily_return"]),
+            "latest_corr": 1.0,
+            "corr_window": 60,
             "error": None,
         }]
 
@@ -342,11 +430,47 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
 
         self.assertEqual(fig.layout.height, 1120)
         self.assertEqual(fig.layout.margin.t, 145)
-        self.assertGreaterEqual(len(fig.data), 10)
+        self.assertGreaterEqual(len(fig.data), 11)
         self.assertTrue(fig.layout.annotations)
         self.assertGreaterEqual(len(fig.layout.annotations), 2)
         self.assertIn("현재 상태", fig.layout.annotations[-1].text)
         self.assertIn("점수", fig.layout.annotations[-1].text)
+
+        annotation_text = " ".join(annotation.text or "" for annotation in fig.layout.annotations)
+        self.assertIn("60D", annotation_text)
+
+        fig_without_excess = sa.plot_dashboard(
+            df,
+            "TEST",
+            stats,
+            current_state=current_state,
+            benchmark_comparison=benchmark_comparison,
+            show_excess_return=False,
+        )
+        self.assertEqual(len(fig_without_excess.data), len(fig.data) - 1)
+
+        fig_excess_only = sa.plot_dashboard(
+            df,
+            "TEST",
+            stats,
+            current_state=current_state,
+            benchmark_comparison=benchmark_comparison,
+            benchmark_display="excess",
+        )
+        self.assertLess(len(fig_excess_only.data), len(fig.data))
+
+        fig_without_marker_legend = sa.plot_dashboard(
+            df,
+            "TEST",
+            stats,
+            current_state=current_state,
+            benchmark_comparison=benchmark_comparison,
+            show_marker_legend=False,
+        )
+        marker_names = {"골든크로스", "데드크로스", "RSI 매수", "RSI 매도", "MACD 골든", "MACD 데드"}
+        marker_traces = [trace for trace in fig_without_marker_legend.data if trace.name in marker_names]
+        self.assertTrue(marker_traces)
+        self.assertTrue(all(trace.showlegend is False for trace in marker_traces))
 
     @unittest.skipUnless(
         os.getenv("RUN_NETWORK_TESTS") == "1",

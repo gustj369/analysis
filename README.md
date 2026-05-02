@@ -53,16 +53,18 @@ Signal score is a simple 5-point checklist:
 
 This score is a quick technical snapshot, not a buy/sell recommendation.
 
-The analysis also prints a simple benchmark comparison against `SPY` and `QQQ`.
-It shows total return, annualized return, MDD, and the analyzed ticker's excess return versus each benchmark for the same available date range.
-Generated Plotly dashboards also include a compact benchmark excess-return summary near the top.
-The dashboard includes a cumulative-return comparison line chart below the MACD panel.
+The analysis also prints a simple benchmark comparison.
+It shows total return, annualized return, MDD, excess return, and latest rolling correlation versus each benchmark for the same available date range.
+Generated Plotly dashboards also include a compact benchmark excess-return and rolling-correlation summary near the top.
+The dashboard includes cumulative-return and/or excess-return comparison lines below the MACD panel.
 
 Default benchmarks are selected by asset type:
 
 - Global stocks: `SPY`, `QQQ`
 - Korean stocks: `EWY`, `SPY`
 - Crypto assets: `BTC-USD`, `ETH-USD` with the analyzed ticker removed when duplicated
+
+You can also choose a preset explicitly with `--benchmark-preset auto|us|korea|crypto|off`.
 
 ### Fixed Historical Period
 
@@ -94,6 +96,8 @@ Run a Korean stock:
 python stock_analysis.py 005930 --years 2
 ```
 
+Korean stock runs print a small data sanity check for latest close, adjusted-close ratio, close-price range, and yfinance `.KS/.KQ` reference price when available.
+
 Run a crypto asset:
 
 ```powershell
@@ -124,6 +128,45 @@ Choose custom benchmarks:
 python stock_analysis.py AAPL --years 1 --benchmarks SPY,QQQ,VTI
 ```
 
+Choose a benchmark preset:
+
+```powershell
+python stock_analysis.py BTC-USD --years 1 --benchmark-preset crypto
+python stock_analysis.py AAPL --years 1 --benchmark-preset off
+```
+
+Hide excess-return lines when the benchmark panel gets crowded:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --no-excess-line
+```
+
+Hide auxiliary signal markers from the legend:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --hide-marker-legend
+```
+
+Choose the benchmark panel line mode or rolling-correlation window:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --benchmark-display cumulative
+python stock_analysis.py AAPL --years 1 --benchmark-display excess --corr-window 30
+```
+
+Programmatic runs return the Korean-data checks as dictionaries:
+
+```python
+from stock_analysis import run_analysis
+
+result = run_analysis("005930", show_chart=False)
+print(result["data_quality"])
+print(result["external_price_check"])
+```
+
+`data_quality["warnings"]` may include values such as `adjusted_close_diff`, `wide_close_range`, `latest_close_outlier`, or `large_daily_move`.
+For Korean stocks, treat these as a prompt to compare the latest close against another data source before interpreting returns.
+
 ## Tests
 
 Run the network-free unit tests:
@@ -148,6 +191,15 @@ Install dependencies first if you want the Plotly test to run instead of skip:
 python -m pip install -r requirements.txt
 python -m unittest -v
 ```
+
+For a visual dashboard check on a local machine with Plotly installed:
+
+```powershell
+python stock_analysis.py AAPL --years 1
+python stock_analysis.py AAPL --years 1 --hide-marker-legend
+```
+
+Open the generated HTML and capture a screenshot. Check that the top summary is visible, the candlestick chart is not blank, benchmark lines appear in the bottom panel, and the second command keeps signal markers on the chart while shortening the legend.
 
 ## GitHub Upload
 
