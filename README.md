@@ -20,10 +20,36 @@ Python script for fetching market data, calculating technical indicators, runnin
 ## Setup
 
 ```powershell
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Usage
+
+### Latest Analysis
+
+Analyze the latest available one-year data and generate a dashboard:
+
+```powershell
+python stock_analysis.py AAPL --years 1
+```
+
+Analyze the latest available one-year data without generating a chart:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --no-chart
+```
+
+### Fixed Historical Period
+
+Analyze a specific historical period:
+
+```powershell
+python stock_analysis.py AAPL --start 2024-01-01 --end 2024-03-15
+```
+
+Fixed historical periods are useful for stable tests and repeatable comparisons. Latest analysis should use `--years`.
+
+### Other Examples
 
 Run with the default settings:
 
@@ -88,7 +114,7 @@ Plotly dashboard structure tests are skipped automatically if Plotly is not inst
 Install dependencies first if you want the Plotly test to run instead of skip:
 
 ```powershell
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python -m unittest -v
 ```
 
