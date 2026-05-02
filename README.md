@@ -8,6 +8,7 @@ Python script for fetching market data, calculating technical indicators, runnin
 - Fetches Korean stocks with `FinanceDataReader`
 - Calculates MA, RSI, MACD, return, volatility, Sharpe ratio, and MDD
 - Compares a golden-cross strategy with buy-and-hold
+- Prints a current-state summary for trend, RSI, MACD, and signal score
 - Generates interactive Plotly dashboards
 
 ## Project Files
@@ -38,6 +39,30 @@ Analyze the latest available one-year data without generating a chart:
 ```powershell
 python stock_analysis.py AAPL --years 1 --no-chart
 ```
+
+The console output includes a current-state summary such as trend direction, price position versus moving averages, RSI state, MACD momentum, and a 0-5 signal score.
+The same summary is also shown near the top of generated Plotly dashboards.
+
+Signal score is a simple 5-point checklist:
+
+- Close is above MA20
+- Close is above MA60
+- MA20 is above MA60
+- MACD is above the MACD signal line
+- RSI is between 40 and 70
+
+This score is a quick technical snapshot, not a buy/sell recommendation.
+
+The analysis also prints a simple benchmark comparison against `SPY` and `QQQ`.
+It shows total return, annualized return, MDD, and the analyzed ticker's excess return versus each benchmark for the same available date range.
+Generated Plotly dashboards also include a compact benchmark excess-return summary near the top.
+The dashboard includes a cumulative-return comparison line chart below the MACD panel.
+
+Default benchmarks are selected by asset type:
+
+- Global stocks: `SPY`, `QQQ`
+- Korean stocks: `EWY`, `SPY`
+- Crypto assets: `BTC-USD`, `ETH-USD` with the analyzed ticker removed when duplicated
 
 ### Fixed Historical Period
 
@@ -93,6 +118,12 @@ Overwrite the dashboard HTML instead of using a timestamped filename:
 python stock_analysis.py AAPL --overwrite
 ```
 
+Choose custom benchmarks:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --benchmarks SPY,QQQ,VTI
+```
+
 ## Tests
 
 Run the network-free unit tests:
@@ -132,3 +163,4 @@ git push -u origin main
 
 - Market data depends on external data providers and may change over time.
 - Generated dashboard HTML files are intentionally ignored by Git.
+- Benchmark comparison uses `SPY` and `QQQ` as broad U.S. market references. For Korean stocks or crypto assets, interpret this as a rough external comparison rather than a perfect peer benchmark.

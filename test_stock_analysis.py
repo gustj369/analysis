@@ -88,6 +88,19 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertIn("RSI", result.columns)
         self.assertIn("MACD", result.columns)
 
+    def test_summarize_current_state_reports_latest_signal_score(self):
+        df = sa.add_indicators(self._sample_price_frame())
+
+        summary = sa.summarize_current_state(df)
+
+        self.assertEqual(summary["trend"], "상승 우위")
+        self.assertGreaterEqual(summary["signal_score"], 4)
+        self.assertEqual(summary["signal_score_max"], 5)
+        self.assertTrue(summary["price_position"]["above_ma20"])
+        self.assertTrue(summary["price_position"]["above_ma60"])
+        self.assertIn(summary["rsi_state"], {"중립~강세", "과매수"})
+        self.assertIn("모멘텀", summary["macd_state"])
+
     def test_main_passes_no_chart_cli_option(self):
         argv = ["stock_analysis.py", "BTC-USD", "--years", "1", "--no-chart"]
 
@@ -115,6 +128,8 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "--rfr",
             "0.02",
             "--overwrite",
+            "--benchmarks",
+            "VTI,QQQ",
         ]
 
         with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
@@ -129,6 +144,69 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertEqual(kwargs["commission"], 0.001)
         self.assertEqual(kwargs["risk_free_rate"], 0.02)
         self.assertTrue(kwargs["overwrite_html"])
+        self.assertEqual(kwargs["benchmarks"], ("VTI", "QQQ"))
+
+    def test_run_analysis_includes_current_state_summary(self):
+        df = self._sample_price_frame()
+
+        with patch.object(sa, "fetch_data", return_value=df), patch.object(
+            sa, "_check_deps"
+        ), patch.object(sa, "print_benchmark_report"), patch.object(
+            sa, "print_backtest_report"
+        ), patch(
+            "sys.stdout", new_callable=StringIO
+        ):
+            result = sa.run_analysis("TEST", show_chart=False)
+
+        self.assertIn("current_state", result)
+        self.assertIn("benchmark_comparison", result)
+        self.assertEqual(result["current_state"]["trend"], "상승 우위")
+        self.assertEqual(result["current_state"]["signal_score_max"], 5)
+        self.assertEqual([row["ticker"] for row in result["benchmark_comparison"]], ["SPY", "QQQ"])
+
+    def test_compute_benchmark_comparison_reports_excess_return(self):
+        target_df = self._sample_price_frame(close=np.array([100.0, 120.0]))
+        benchmark_df = self._sample_price_frame(close=np.array([100.0, 110.0]))
+        target_stats = sa.compute_returns(target_df, risk_free_rate=0.0, annualization_days=252)
+
+        with patch.object(sa, "fetch_data", return_value=benchmark_df):
+            rows = sa.compute_benchmark_comparison(
+                target_stats,
+                start="2024-01-01",
+                end="2024-01-03",
+                risk_free_rate=0.0,
+                annualization_days=252,
+                benchmarks=("SPY",),
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ticker"], "SPY")
+        self.assertIsNone(rows[0]["error"])
+        self.assertAlmostEqual(rows[0]["total_return"], 0.10)
+        self.assertAlmostEqual(rows[0]["excess_return"], 0.10)
+        self.assertIn("cumulative_return", rows[0])
+
+    def test_compute_benchmark_comparison_keeps_fetch_errors(self):
+        target_df = self._sample_price_frame(close=np.array([100.0, 120.0]))
+        target_stats = sa.compute_returns(target_df, risk_free_rate=0.0, annualization_days=252)
+
+        with patch.object(sa, "fetch_data", side_effect=ValueError("data unavailable")):
+            rows = sa.compute_benchmark_comparison(
+                target_stats,
+                start="2024-01-01",
+                end="2024-01-03",
+                benchmarks=("SPY",),
+            )
+
+        self.assertEqual(rows[0]["ticker"], "SPY")
+        self.assertIsNone(rows[0]["total_return"])
+        self.assertIsNone(rows[0]["cumulative_return"])
+        self.assertIn("data unavailable", rows[0]["error"])
+
+    def test_default_benchmarks_follow_asset_type(self):
+        self.assertEqual(sa._default_benchmarks_for_ticker("AAPL"), ("SPY", "QQQ"))
+        self.assertEqual(sa._default_benchmarks_for_ticker("005930"), ("EWY", "SPY"))
+        self.assertEqual(sa._default_benchmarks_for_ticker("BTC-USD"), ("ETH-USD",))
 
     def test_backtest_golden_cross_returns_expected_shape(self):
         close = np.concatenate([
@@ -242,11 +320,33 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
     def test_plot_dashboard_returns_plotly_figure(self):
         df = sa.add_indicators(self._sample_price_frame())
         stats = sa.compute_returns(df, risk_free_rate=0.0, annualization_days=252)
+        current_state = sa.summarize_current_state(df)
 
-        fig = sa.plot_dashboard(df, "TEST", stats)
+        benchmark_comparison = [{
+            "ticker": "SPY",
+            "total_return": 0.10,
+            "annual_return": 0.20,
+            "mdd": -0.05,
+            "excess_return": 0.03,
+            "cumulative_return": stats["cumulative_return"],
+            "error": None,
+        }]
 
-        self.assertEqual(fig.layout.height, 1000)
-        self.assertGreaterEqual(len(fig.data), 8)
+        fig = sa.plot_dashboard(
+            df,
+            "TEST",
+            stats,
+            current_state=current_state,
+            benchmark_comparison=benchmark_comparison,
+        )
+
+        self.assertEqual(fig.layout.height, 1120)
+        self.assertEqual(fig.layout.margin.t, 145)
+        self.assertGreaterEqual(len(fig.data), 10)
+        self.assertTrue(fig.layout.annotations)
+        self.assertGreaterEqual(len(fig.layout.annotations), 2)
+        self.assertIn("현재 상태", fig.layout.annotations[-1].text)
+        self.assertIn("점수", fig.layout.annotations[-1].text)
 
     @unittest.skipUnless(
         os.getenv("RUN_NETWORK_TESTS") == "1",
