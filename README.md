@@ -57,6 +57,8 @@ The analysis also prints a simple benchmark comparison.
 It shows total return, annualized return, MDD, excess return, and latest rolling correlation versus each benchmark for the same available date range.
 Generated Plotly dashboards also include a compact benchmark excess-return and rolling-correlation summary near the top.
 The dashboard includes cumulative-return and/or excess-return comparison lines below the MACD panel.
+The default benchmark panel shows cumulative-return lines only, keeping excess-return lines available through `--benchmark-display all` or `--benchmark-display excess`.
+Use `--chart-mode full` when you want all benchmark lines, signal markers, and benchmark legend entries visible together.
 
 Default benchmarks are selected by asset type:
 
@@ -135,6 +137,13 @@ python stock_analysis.py BTC-USD --years 1 --benchmark-preset crypto
 python stock_analysis.py AAPL --years 1 --benchmark-preset off
 ```
 
+Choose a chart mode:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --chart-mode clean
+python stock_analysis.py AAPL --years 1 --chart-mode full
+```
+
 Hide excess-return lines when the benchmark panel gets crowded:
 
 ```powershell
@@ -147,10 +156,18 @@ Hide auxiliary signal markers from the legend:
 python stock_analysis.py AAPL --years 1 --hide-marker-legend
 ```
 
+Hide auxiliary signal markers from the chart:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --hide-signal-markers
+python stock_analysis.py AAPL --years 1 --show-signal-markers
+```
+
 Choose the benchmark panel line mode or rolling-correlation window:
 
 ```powershell
 python stock_analysis.py AAPL --years 1 --benchmark-display cumulative
+python stock_analysis.py AAPL --years 1 --benchmark-display all
 python stock_analysis.py AAPL --years 1 --benchmark-display excess --corr-window 30
 ```
 
@@ -162,10 +179,12 @@ from stock_analysis import run_analysis
 result = run_analysis("005930", show_chart=False)
 print(result["data_quality"])
 print(result["external_price_check"])
+print(result["strategy_summary"])
 ```
 
 `data_quality["warnings"]` may include values such as `adjusted_close_diff`, `wide_close_range`, `latest_close_outlier`, or `large_daily_move`.
 For Korean stocks, treat these as a prompt to compare the latest close against another data source before interpreting returns.
+Generated dashboards also surface these warning codes in the top summary.
 
 ## Tests
 
@@ -196,10 +215,13 @@ For a visual dashboard check on a local machine with Plotly installed:
 
 ```powershell
 python stock_analysis.py AAPL --years 1
+python stock_analysis.py AAPL --years 1 --chart-mode full
 python stock_analysis.py AAPL --years 1 --hide-marker-legend
+python stock_analysis.py AAPL --years 1 --hide-signal-markers
 ```
 
-Open the generated HTML and capture a screenshot. Check that the top summary is visible, the candlestick chart is not blank, benchmark lines appear in the bottom panel, and the second command keeps signal markers on the chart while shortening the legend.
+Open the generated HTML and capture a screenshot. Check that the top summary separates current state, performance, benchmark, strategy, and any data-warning lines; the candlestick chart is not blank; benchmark lines appear in the taller bottom panel; and `full` mode shows grouped legend entries for price, indicators, and benchmarks.
+For Korean stocks with data warnings, confirm that the top summary shows the warning line in a distinct accent color.
 
 ## GitHub Upload
 

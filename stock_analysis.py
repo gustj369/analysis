@@ -6,29 +6,76 @@
 - 골든크로스 전략 백테스팅
 """
 
-import warnings
-warnings.filterwarnings("ignore")
-
+# ── 표준 라이브러리 ───────────────────────────────────────────────────────────
+import re
 import sys
 import math
 import argparse
-from datetime import datetime, timedelta
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# ── 서드파티 (항상 사용) ─────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
 
+# ── 경고 필터: 전역 억제 대신 특정 라이브러리·카테고리만 차단 ────────────────
+# [FIX 1차 H-1] warnings.filterwarnings("ignore") 전역 설정 → 범위 축소
+warnings.filterwarnings("ignore", category=FutureWarning,      module="yfinance")
+warnings.filterwarnings("ignore", category=FutureWarning,      module="pandas")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="yfinance")
+warnings.filterwarnings("ignore", category=UserWarning,        module="yfinance")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 모듈 레벨 기본값 상수
+# [FIX 1차 H-3] main() 내부 정의 → 모듈 레벨 이동 (CLI·시그니처·로직 공유)
+# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_TICKER          = "AAPL"
+DEFAULT_PERIOD_YEARS    = 2.0
+DEFAULT_INITIAL_CAPITAL = 10_000_000
+DEFAULT_COMMISSION      = 0.00015
+DEFAULT_RISK_FREE_RATE  = 0.03
+
+# ── 벤치마크 프리셋 ──────────────────────────────────────────────────────────
 DEFAULT_BENCHMARKS = ("SPY", "QQQ")
-KOREA_BENCHMARKS = ("EWY", "SPY")
-CRYPTO_BENCHMARKS = ("BTC-USD", "ETH-USD")
-BENCHMARK_PRESETS = {
-    "us": DEFAULT_BENCHMARKS,
-    "korea": KOREA_BENCHMARKS,
+KOREA_BENCHMARKS   = ("EWY", "SPY")
+CRYPTO_BENCHMARKS  = ("BTC-USD", "ETH-USD")
+BENCHMARK_PRESETS  = {
+    "us":     DEFAULT_BENCHMARKS,
+    "korea":  KOREA_BENCHMARKS,
     "crypto": CRYPTO_BENCHMARKS,
 }
 
-# ── 의존성: import 실패를 None으로 보존 → 실행 시점에만 에러 발생 ──
+# ── 데이터 품질 임계값 ───────────────────────────────────────────────────────
+# [FIX 2차 A-3] 인라인 매직 넘버 → 이름 있는 상수
+MIN_DATA_ROWS                = 30      # 분석에 필요한 최소 거래일 수
+DAILY_RETURN_ALERT_THRESHOLD = 0.35   # 일간 변동률 이상치 경계 (35%)
+CLOSE_RANGE_ALERT_RATIO      = 4.0    # 기간 최고/최저 비율 경계 (4배)
+LATEST_VS_MEDIAN_HIGH        = 3.0    # 최근 종가/중앙값 상한 (3배)
+LATEST_VS_MEDIAN_LOW         = 0.33   # 최근 종가/중앙값 하한 (1/3)
+ADJ_CLOSE_DIFF_THRESHOLD     = 0.01   # 수정종가/종가 차이 경계 (1%)
+REFERENCE_PRICE_DIFF_PCT     = 1.0    # 외부 기준 가격 차이 경계 (1%)
+
+# ── 시각화 상수 ──────────────────────────────────────────────────────────────
+CHART_ROW_HEIGHTS   = (0.34, 0.12, 0.16, 0.16, 0.22)
+CHART_MARGIN_BOTH   = 145   # 대시보드 요약 어노테이션
+CHART_MARGIN_ONE    = 120   # 대시보드 요약 어노테이션
+CHART_MARGIN_NONE   = 90    # 어노테이션 없음
+MA_COLORS = {
+    "MA5":   "#FFA726",   # 주황
+    "MA20":  "#42A5F5",   # 파랑
+    "MA60":  "#AB47BC",   # 보라
+    "MA120": "#EC407A",   # 핑크 (캔들 상승색 #EF5350 과 혼동 방지)
+}
+BENCHMARK_LINE_COLORS = ["#00BCD4", "#FFD54F", "#A5D6A7", "#CE93D8"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 의존성: import 실패를 None 으로 보존 → 실행 시점에만 에러 발생
 # (import 시점 sys.exit 제거 → 순수 함수 단위 테스트·부분 import 가능)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     import yfinance as yf
     _yfinance_ok = True
@@ -57,7 +104,7 @@ def _check_deps(need_plotly: bool = True, need_fdr: bool = False) -> None:
     """
     실행 시점에 필수 의존성을 확인한다.
     import 시점이 아닌 실제 사용 직전에 호출해 에러를 늦춤으로써
-    계산 함수만 import해 테스트하는 경우를 허용한다.
+    계산 함수만 import 해 테스트하는 경우를 허용한다.
     """
     missing: list[str] = []
     if not _yfinance_ok:
@@ -81,26 +128,26 @@ def _validate_params(ticker: str,
                      initial_capital: float,
                      commission: float,
                      period_years: float) -> None:
-    """핵심 파라미터 사전 검증. 문제가 있으면 ValueError를 발생시킨다."""
+    """핵심 파라미터 사전 검증. 문제가 있으면 ValueError 를 발생시킨다."""
     if not ticker or not ticker.strip():
-        raise ValueError("ticker는 빈 문자열일 수 없습니다.")
+        raise ValueError("ticker 는 빈 문자열일 수 없습니다.")
     if initial_capital <= 0:
         raise ValueError(
-            f"initial_capital은 0보다 커야 합니다. (입력값: {initial_capital:,})"
+            f"initial_capital 은 0 보다 커야 합니다. (입력값: {initial_capital:,})"
         )
     if not (0 <= commission < 1):
         raise ValueError(
-            f"commission은 0 이상 1 미만이어야 합니다. (입력값: {commission})"
+            f"commission 은 0 이상 1 미만이어야 합니다. (입력값: {commission})"
         )
     if period_years <= 0:
         raise ValueError(
-            f"period_years는 0보다 커야 합니다. (입력값: {period_years})"
+            f"period_years 는 0 보다 커야 합니다. (입력값: {period_years})"
         )
 
 
 def _detect_annualization_days(df: pd.DataFrame) -> int:
     """
-    데이터에 주말 행이 있으면 365, 없으면 252를 반환한다.
+    데이터에 주말 행이 있으면 365, 없으면 252 를 반환한다.
 
     - 주식(평일 거래): 252
     - 암호화폐·24/7 자산: 365
@@ -109,22 +156,25 @@ def _detect_annualization_days(df: pd.DataFrame) -> int:
     return 365 if any(d.weekday() >= 5 for d in sample) else 252
 
 
+# ──────────────────────────────────────────────
+# 벤치마크 설정 헬퍼
+# [FIX 1차 H-2 / 2차 B-1] 공통 헬퍼 구역에서 분리
+# ──────────────────────────────────────────────
+
 def _parse_benchmarks(value: str) -> tuple[str, ...]:
-    """Parse comma-separated benchmark tickers while preserving order."""
-    items = []
+    """쉼표 구분 벤치마크 티커 파싱 (순서 보존, 중복 제거)."""
+    items: list[str] = []
     for item in value.split(","):
         benchmark = item.strip().upper()
         if benchmark and benchmark not in items:
             items.append(benchmark)
-
     if not items:
         raise argparse.ArgumentTypeError("benchmarks must include at least one ticker")
-
     return tuple(items)
 
 
 def _positive_int(value: str) -> int:
-    """Parse a positive integer CLI value."""
+    """양의 정수 CLI 값 파싱."""
     try:
         parsed = int(value)
     except ValueError:
@@ -135,19 +185,24 @@ def _positive_int(value: str) -> int:
 
 
 def _default_benchmarks_for_ticker(ticker: str) -> tuple[str, ...]:
-    """Choose a small default benchmark set by asset type."""
+    """자산 유형에 따른 기본 벤치마크 선택."""
     normalized = ticker.strip().upper()
     if is_korean_ticker(normalized):
         return KOREA_BENCHMARKS
     if normalized.endswith("-USD"):
-        return tuple(item for item in CRYPTO_BENCHMARKS if item != normalized) or DEFAULT_BENCHMARKS
+        filtered = tuple(item for item in CRYPTO_BENCHMARKS if item != normalized)
+        return filtered if filtered else DEFAULT_BENCHMARKS
     return DEFAULT_BENCHMARKS
 
 
 def _select_benchmarks(ticker: str,
                        benchmarks: tuple[str, ...] | None = None,
                        preset: str = "auto") -> tuple[str, ...]:
-    """Resolve explicit benchmarks or an asset-class benchmark preset."""
+    """
+    명시적 벤치마크 또는 자산 유형 프리셋으로 벤치마크를 결정한다.
+
+    [FIX 1차 B-3] BENCHMARK_PRESETS[preset] KeyError → .get() 방어 처리
+    """
     if benchmarks:
         return benchmarks
     if preset == "off":
@@ -155,26 +210,38 @@ def _select_benchmarks(ticker: str,
     if preset == "auto":
         selected = _default_benchmarks_for_ticker(ticker)
     else:
-        selected = BENCHMARK_PRESETS[preset]
+        selected = BENCHMARK_PRESETS.get(preset)
+        if selected is None:
+            raise ValueError(
+                f"알 수 없는 benchmark_preset: '{preset}'. "
+                f"허용값: {list(BENCHMARK_PRESETS) + ['auto', 'off']}"
+            )
 
     normalized = ticker.strip().upper()
     return tuple(item for item in selected if item != normalized)
 
 
-def _make_html_path(ticker: str, overwrite: bool = False) -> Path:
+def _make_html_path(ticker: str,
+                    overwrite: bool = False,
+                    output_dir: str | Path = ".") -> Path:
     """
     대시보드 HTML 저장 경로를 결정한다.
 
     overwrite=True  → <ticker>_dashboard.html  (기존 파일 덮어쓰기)
     overwrite=False → <ticker>_YYYYMMDD_HHMMSS_dashboard.html (타임스탬프)
+
+    [FIX 2차 C-4] ".." 등 경로 순회 문자 차단 — 영숫자·하이픈·밑줄만 허용
+    [FIX 2차 B-2] output_dir 파라미터 추가 (기본: 현재 디렉터리)
     """
-    safe = ticker.replace("/", "_").replace(":", "_")
+    safe = re.sub(r"[^\w\-]", "_", ticker)   # [FIX] 안전한 파일명
     if overwrite:
         fname = f"{safe}_dashboard.html"
     else:
         ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"{safe}_{ts}_dashboard.html"
-    return Path(fname)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    return out / fname
 
 
 # ──────────────────────────────────────────────
@@ -186,7 +253,7 @@ def is_korean_ticker(ticker: str) -> bool:
     return ticker.isdigit() and len(ticker) == 6
 
 
-def fetch_data(ticker: str, period_years: float = 1.0,
+def fetch_data(ticker: str, period_years: float = DEFAULT_PERIOD_YEARS,
                start: str = None, end: str = None) -> pd.DataFrame:
     """
     주가 데이터를 수집하여 DataFrame 반환.
@@ -202,15 +269,17 @@ def fetch_data(ticker: str, period_years: float = 1.0,
     -------
     DataFrame (index=DatetimeIndex, columns=[Open,High,Low,Close,Volume,Adj Close])
     """
+    # [FIX 2차 B-3] datetime.today() → UTC 기준 (로컬 시간대 의존 제거)
+    now_utc = datetime.now(timezone.utc)
     if end is None:
-        end = datetime.today().strftime("%Y-%m-%d")
+        end = now_utc.strftime("%Y-%m-%d")
     if start is None:
-        start = (datetime.today() - timedelta(days=int(period_years * 365))).strftime("%Y-%m-%d")
+        start = (now_utc - timedelta(days=int(period_years * 365))).strftime("%Y-%m-%d")
 
     # 날짜 유효성 검사
     try:
         s_dt = datetime.strptime(start, "%Y-%m-%d")
-        e_dt = datetime.strptime(end, "%Y-%m-%d")
+        e_dt = datetime.strptime(end,   "%Y-%m-%d")
     except ValueError:
         raise ValueError(f"날짜 형식 오류: start={start}, end={end}. 형식: YYYY-MM-DD")
 
@@ -218,11 +287,10 @@ def fetch_data(ticker: str, period_years: float = 1.0,
         raise ValueError(f"시작일({start})이 종료일({end})보다 같거나 늦습니다.")
 
     ticker = ticker.strip()
-    # [FIX] 글로벌 종목은 대문자 강제 (yfinance는 소문자 티커 실패)
+    # 글로벌 종목은 대문자 강제 (yfinance 는 소문자 티커 실패)
     if not is_korean_ticker(ticker):
         ticker = ticker.upper()
 
-    # 한국 주식
     if is_korean_ticker(ticker):
         if fdr is None:
             raise ImportError("FinanceDataReader 미설치. pip install finance-datareader")
@@ -236,7 +304,7 @@ def fetch_data(ticker: str, period_years: float = 1.0,
     # 컬럼 정규화
     df = _normalize_columns(df)
 
-    # [FIX] DatetimeIndex 보장
+    # DatetimeIndex 보장
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
     df.index.name = "Date"
@@ -247,15 +315,18 @@ def fetch_data(ticker: str, period_years: float = 1.0,
         print(f"[경고] {nan_count}개 결측값 감지 → forward fill 적용")
     df = df.ffill().dropna()
 
-    if len(df) < 30:
-        raise ValueError(f"'{ticker}' 데이터가 너무 짧습니다 ({len(df)}일). 기간을 늘려보세요.")
+    # [FIX 2차 A-3] 30 → MIN_DATA_ROWS 상수 사용
+    if len(df) < MIN_DATA_ROWS:
+        raise ValueError(
+            f"'{ticker}' 데이터가 너무 짧습니다 ({len(df)}일). 기간을 늘려보세요."
+        )
 
     print(f"[데이터 수집 완료] {ticker} | {df.index[0].date()} ~ {df.index[-1].date()} | {len(df)}거래일")
     return df
 
 
 def _fetch_korean(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """FinanceDataReader로 한국 주식 수집."""
+    """FinanceDataReader 로 한국 주식 수집."""
     try:
         df = fdr.DataReader(ticker, start, end)
         return df
@@ -264,14 +335,20 @@ def _fetch_korean(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """yfinance로 글로벌 주식 수집."""
+    """
+    yfinance 로 글로벌 주식 수집.
+
+    [FIX 2차 C-1] timeout=30 추가 (무한 대기 방지)
+    """
     try:
-        raw = yf.download(ticker, start=start, end=end,
-                          auto_adjust=False, progress=False)
+        raw = yf.download(
+            ticker, start=start, end=end,
+            auto_adjust=False, progress=False, timeout=30,
+        )
         if raw.empty:
             raise ValueError(f"yfinance: '{ticker}' 데이터 없음")
 
-        # [FIX] MultiIndex 평탄화 후 중복 컬럼 제거
+        # MultiIndex 평탄화 후 중복 컬럼 제거
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
         raw = raw.loc[:, ~raw.columns.duplicated(keep="first")]
@@ -283,124 +360,38 @@ def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
         raise ValueError(f"글로벌 주식 데이터 수집 실패 ({ticker}): {e}")
 
 
-def print_data_quality_check(ticker: str, df: pd.DataFrame) -> dict:
-    """Print a small data sanity check for sources that need extra interpretation."""
-    if not is_korean_ticker(ticker):
-        return {"checked": False, "reason": "not_korean_ticker"}
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    컬럼명을 표준 형식으로 통일.
 
-    latest = df.iloc[-1]
-    close = float(latest["Close"])
-    adj_close = float(latest["Adj Close"])
-    ratio = adj_close / close if close else 0.0
-    min_close = float(df["Close"].min())
-    max_close = float(df["Close"].max())
-    median_close = float(df["Close"].median())
-    close_range_ratio = max_close / min_close if min_close else 0.0
-    latest_vs_median = close / median_close if median_close else 0.0
-    max_abs_daily_return = float(df["Close"].pct_change().abs().max(skipna=True) or 0.0)
+    [FIX 2차 B-4] 동일 표준 이름으로 여러 컬럼이 매핑될 때 중복 감지·경고
+    """
+    rename_map: dict = {}
+    seen_targets: set[str] = set()
 
-    print(f"[데이터 검증] {ticker} | 최근 종가 {close:,.0f} | 수정종가/종가 {ratio:.3f} | "
-          f"기간 종가 범위 {min_close:,.0f}~{max_close:,.0f}")
-    warnings = []
-    if abs(ratio - 1.0) > 0.01:
-        warnings.append("adjusted_close_diff")
-        print("[경고] 수정종가와 종가 차이가 큽니다. 액면분할/배당 조정 여부를 확인하세요.")
-    if close_range_ratio >= 4.0:
-        warnings.append("wide_close_range")
-        print(f"[경고] 기간 중 종가 범위가 넓습니다 ({close_range_ratio:.2f}배). 액면분할/거래정지/데이터 원천을 확인하세요.")
-    if latest_vs_median >= 3.0 or latest_vs_median <= 0.33:
-        warnings.append("latest_close_outlier")
-        print(f"[경고] 최근 종가가 기간 중앙값과 크게 다릅니다 ({latest_vs_median:.2f}배). 최신 원천 데이터를 확인하세요.")
-    if max_abs_daily_return > 0.35:
-        warnings.append("large_daily_move")
-        print(f"[경고] 일간 종가 변동률이 비정상적으로 큽니다 ({max_abs_daily_return*100:.2f}%). 원천 데이터 이상 여부를 확인하세요.")
-
-    return {
-        "checked": True,
-        "ticker": ticker,
-        "latest_close": close,
-        "latest_adj_close": adj_close,
-        "adj_close_ratio": ratio,
-        "min_close": min_close,
-        "max_close": max_close,
-        "close_range_ratio": close_range_ratio,
-        "latest_vs_median": latest_vs_median,
-        "max_abs_daily_return": max_abs_daily_return,
-        "warning": warnings[0] if warnings else None,
-        "warnings": warnings,
-    }
-
-
-def print_external_price_check(ticker: str, df: pd.DataFrame) -> dict:
-    """Compare Korean stock source prices with a yfinance reference when possible."""
-    if not is_korean_ticker(ticker):
-        return {"checked": False, "reason": "not_korean_ticker"}
-    if not _yfinance_ok:
-        print("[외부 기준 가격] yfinance 미설치로 비교를 건너뜁니다.")
-        return {"checked": False, "reason": "yfinance_not_installed"}
-
-    start = df.index[max(len(df) - 10, 0)].strftime("%Y-%m-%d")
-    end = (df.index[-1] + timedelta(days=2)).strftime("%Y-%m-%d")
-    reference_df = None
-    reference_ticker = None
-    failures = {}
-
-    for suffix in (".KS", ".KQ"):
-        candidate = f"{ticker}{suffix}"
-        try:
-            reference_df = _normalize_columns(_fetch_global(candidate, start, end)).ffill().dropna()
-            reference_ticker = candidate
-            break
-        except Exception as exc:
-            failures[candidate] = str(exc)
+    for col in df.columns:
+        col_lower = str(col).lower().strip().replace(" ", "_")
+        # 'adj' + 'close' 를 'close' 단독보다 먼저 체크
+        if "adj" in col_lower and "close" in col_lower:
+            target = "Adj Close"
+        elif "open" in col_lower:
+            target = "Open"
+        elif "high" in col_lower:
+            target = "High"
+        elif "low" in col_lower:
+            target = "Low"
+        elif "close" in col_lower:
+            target = "Close"
+        elif "volume" in col_lower or col_lower in ("vol",):
+            target = "Volume"
+        else:
             continue
 
-    if reference_df is None or reference_df.empty:
-        reason = "; ".join(f"{key}: {value}" for key, value in failures.items()) or "no data"
-        print(f"[외부 기준 가격] yfinance .KS/.KQ 기준 가격을 찾지 못했습니다. 사유: {reason}")
-        return {"checked": False, "reason": "reference_not_found", "failures": failures}
-
-    local_close = float(df["Close"].iloc[-1])
-    ref_close = float(reference_df["Close"].iloc[-1])
-    diff_pct = (local_close / ref_close - 1) * 100 if ref_close else 0.0
-    print(f"[외부 기준 가격] FDR {ticker} {local_close:,.0f} | "
-          f"yfinance {reference_ticker} {ref_close:,.0f} | 차이 {diff_pct:+.2f}%")
-    warning = None
-    if abs(diff_pct) > 1.0:
-        warning = "reference_price_diff"
-        print("[경고] 원천 데이터와 외부 기준 가격 차이가 큽니다. 종목 매핑/수정주가를 확인하세요.")
-
-    return {
-        "checked": True,
-        "ticker": ticker,
-        "reference_ticker": reference_ticker,
-        "local_close": local_close,
-        "reference_close": ref_close,
-        "diff_pct": diff_pct,
-        "warning": warning,
-        "failures": failures,
-    }
-
-
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """컬럼명을 표준 형식으로 통일."""
-    rename_map = {}
-    for col in df.columns:
-        # [FIX] strip()으로 앞뒤 공백 제거
-        col_lower = str(col).lower().strip().replace(" ", "_")
-        if "open" in col_lower:
-            rename_map[col] = "Open"
-        elif "high" in col_lower:
-            rename_map[col] = "High"
-        elif "low" in col_lower:
-            rename_map[col] = "Low"
-        elif "adj" in col_lower and "close" in col_lower:
-            # 반드시 "close" 단독 체크보다 먼저 처리
-            rename_map[col] = "Adj Close"
-        elif "close" in col_lower:
-            rename_map[col] = "Close"
-        elif "volume" in col_lower or col_lower in ("vol",):
-            rename_map[col] = "Volume"
+        if target in seen_targets:
+            print(f"[경고] 컬럼 '{col}' → '{target}' 중복 매핑 감지. 첫 번째 컬럼을 사용합니다.")
+            continue
+        seen_targets.add(target)
+        rename_map[col] = target
 
     df = df.rename(columns=rename_map)
 
@@ -418,12 +409,165 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[["Open", "High", "Low", "Close", "Volume", "Adj Close"]]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 데이터 품질 검사
+# [FIX 2차 A-4] 계산 로직과 콘솔 출력 분리
+#   _compute_data_quality_stats   → 순수 계산 (부작용 없음, 단위 테스트 가능)
+#   print_data_quality_check      → 출력 래퍼 (계산 함수 호출 후 결과 출력)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _compute_data_quality_stats(ticker: str, df: pd.DataFrame) -> dict:
+    """한국 종목 데이터 품질 지표 계산 (부작용 없음)."""
+    if not is_korean_ticker(ticker):
+        return {"checked": False, "reason": "not_korean_ticker"}
+
+    latest      = df.iloc[-1]
+    close       = float(latest["Close"])
+    adj_close   = float(latest["Adj Close"])
+    ratio       = adj_close / close if close else 0.0
+    min_close   = float(df["Close"].min())
+    max_close   = float(df["Close"].max())
+    median_close = float(df["Close"].median())
+    close_range_ratio  = max_close / min_close if min_close else 0.0
+    latest_vs_median   = close / median_close if median_close else 0.0
+    max_abs_daily_return = float(df["Close"].pct_change().abs().max(skipna=True) or 0.0)
+
+    # [FIX 1차 B-1] 지역 변수명 'warnings' → 'warning_codes' (stdlib warnings 섀도잉 방지)
+    warning_codes: list[str] = []
+    if abs(ratio - 1.0) > ADJ_CLOSE_DIFF_THRESHOLD:
+        warning_codes.append("adjusted_close_diff")
+    if close_range_ratio >= CLOSE_RANGE_ALERT_RATIO:
+        warning_codes.append("wide_close_range")
+    if latest_vs_median >= LATEST_VS_MEDIAN_HIGH or latest_vs_median <= LATEST_VS_MEDIAN_LOW:
+        warning_codes.append("latest_close_outlier")
+    if max_abs_daily_return > DAILY_RETURN_ALERT_THRESHOLD:
+        warning_codes.append("large_daily_move")
+
+    return {
+        "checked":              True,
+        "ticker":               ticker,
+        "latest_close":         close,
+        "latest_adj_close":     adj_close,
+        "adj_close_ratio":      ratio,
+        "min_close":            min_close,
+        "max_close":            max_close,
+        "close_range_ratio":    close_range_ratio,
+        "latest_vs_median":     latest_vs_median,
+        "max_abs_daily_return": max_abs_daily_return,
+        "warning":              warning_codes[0] if warning_codes else None,
+        "warnings":             warning_codes,
+    }
+
+
+def print_data_quality_check(ticker: str, df: pd.DataFrame) -> dict:
+    """데이터 품질 검사 결과를 콘솔에 출력하고 결과 dict 를 반환."""
+    result = _compute_data_quality_stats(ticker, df)
+    if not result["checked"]:
+        return result
+
+    r = result
+    print(f"[데이터 검증] {r['ticker']} | 최근 종가 {r['latest_close']:,.0f} | "
+          f"수정종가/종가 {r['adj_close_ratio']:.3f} | "
+          f"기간 종가 범위 {r['min_close']:,.0f}~{r['max_close']:,.0f}")
+
+    for code in r["warnings"]:
+        if code == "adjusted_close_diff":
+            print("[경고] 수정종가와 종가 차이가 큽니다. 액면분할/배당 조정 여부를 확인하세요.")
+        elif code == "wide_close_range":
+            print(f"[경고] 기간 중 종가 범위가 넓습니다 ({r['close_range_ratio']:.2f}배). "
+                  "액면분할/거래정지/데이터 원천을 확인하세요.")
+        elif code == "latest_close_outlier":
+            print(f"[경고] 최근 종가가 기간 중앙값과 크게 다릅니다 ({r['latest_vs_median']:.2f}배). "
+                  "최신 원천 데이터를 확인하세요.")
+        elif code == "large_daily_move":
+            print(f"[경고] 일간 종가 변동률이 비정상적으로 큽니다 "
+                  f"({r['max_abs_daily_return']*100:.2f}%). 원천 데이터 이상 여부를 확인하세요.")
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 외부 기준 가격 비교
+# [FIX 2차 A-4] 계산 로직과 콘솔 출력 분리
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _compute_external_price_stats(ticker: str, df: pd.DataFrame) -> dict:
+    """한국 종목과 yfinance .KS/.KQ 기준 가격 비교 계산 (부작용 없음)."""
+    if not is_korean_ticker(ticker):
+        return {"checked": False, "reason": "not_korean_ticker"}
+    if not _yfinance_ok:
+        return {"checked": False, "reason": "yfinance_not_installed"}
+
+    start = df.index[max(len(df) - 10, 0)].strftime("%Y-%m-%d")
+    end   = (df.index[-1] + timedelta(days=2)).strftime("%Y-%m-%d")
+    reference_df     = None
+    reference_ticker = None
+    failures: dict   = {}
+
+    for suffix in (".KS", ".KQ"):
+        candidate = f"{ticker}{suffix}"
+        try:
+            reference_df = _normalize_columns(
+                _fetch_global(candidate, start, end)
+            ).ffill().dropna()
+            reference_ticker = candidate
+            break
+        except Exception as exc:
+            failures[candidate] = str(exc)
+
+    if reference_df is None or reference_df.empty:
+        reason_detail = ("; ".join(f"{k}: {v}" for k, v in failures.items()) or "no data")
+        return {
+            "checked":       False,
+            "reason":        "reference_not_found",
+            "reason_detail": reason_detail,
+            "failures":      failures,
+        }
+
+    local_close = float(df["Close"].iloc[-1])
+    ref_close   = float(reference_df["Close"].iloc[-1])
+    diff_pct    = (local_close / ref_close - 1) * 100 if ref_close else 0.0
+    warning     = "reference_price_diff" if abs(diff_pct) > REFERENCE_PRICE_DIFF_PCT else None
+
+    return {
+        "checked":          True,
+        "ticker":           ticker,
+        "reference_ticker": reference_ticker,
+        "local_close":      local_close,
+        "reference_close":  ref_close,
+        "diff_pct":         diff_pct,
+        "warning":          warning,
+        "failures":         failures,
+    }
+
+
+def print_external_price_check(ticker: str, df: pd.DataFrame) -> dict:
+    """외부 기준 가격 비교 결과를 콘솔에 출력하고 결과 dict 를 반환."""
+    result = _compute_external_price_stats(ticker, df)
+    if not result["checked"]:
+        reason = result.get("reason", "")
+        if reason == "yfinance_not_installed":
+            print("[외부 기준 가격] yfinance 미설치로 비교를 건너뜁니다.")
+        elif reason == "reference_not_found":
+            print(f"[외부 기준 가격] yfinance .KS/.KQ 기준 가격을 찾지 못했습니다. "
+                  f"사유: {result.get('reason_detail', 'no data')}")
+        # not_korean_ticker 는 출력 없음
+        return result
+
+    r = result
+    print(f"[외부 기준 가격] FDR {r['ticker']} {r['local_close']:,.0f} | "
+          f"yfinance {r['reference_ticker']} {r['reference_close']:,.0f} | "
+          f"차이 {r['diff_pct']:+.2f}%")
+    if r["warning"]:
+        print("[경고] 원천 데이터와 외부 기준 가격 차이가 큽니다. 종목 매핑/수정주가를 확인하세요.")
+    return result
+
+
 # ──────────────────────────────────────────────
 # 2단계. 수익률 / 리스크 지표 계산
 # ──────────────────────────────────────────────
 
 def compute_returns(df: pd.DataFrame,
-                    risk_free_rate: float = 0.03,
+                    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
                     annualization_days: int = 252) -> dict:
     """
     일간 수익률, 누적 수익률, 변동성, 샤프 비율, MDD 계산.
@@ -437,12 +581,12 @@ def compute_returns(df: pd.DataFrame,
     Returns
     -------
     dict {
-        'daily_return': Series,
-        'cumulative_return': Series,
-        'annual_volatility': float,
-        'sharpe_ratio': float,
-        'mdd': float,
-        'annual_return': float,
+        'daily_return'      : Series,
+        'cumulative_return' : Series,
+        'annual_volatility' : float,
+        'sharpe_ratio'      : float,
+        'mdd'               : float,
+        'annual_return'     : float,
         'annualization_days': int,
     }
     """
@@ -451,13 +595,13 @@ def compute_returns(df: pd.DataFrame,
     # NaN 유지: std 계산에서 인위적 0 수익률 제외
     daily_ret = close.pct_change()
 
-    # 누적 수익률은 첫 날 NaN → 0으로 채워 cumprod 계산
+    # 누적 수익률: 첫날 NaN → 0 으로 채워 cumprod 계산
     cum_ret = (1 + daily_ret.fillna(0)).cumprod()
 
     # 실제 수익률 개수 (첫 NaN 제외) 로 연환산
-    n_days = max(len(daily_ret.dropna()), 1)
-
+    n_days    = max(len(daily_ret.dropna()), 1)
     final_cum = cum_ret.iloc[-1]
+
     if final_cum > 0 and n_days > 0:
         annual_ret = (final_cum ** (annualization_days / n_days)) - 1
     else:
@@ -466,7 +610,7 @@ def compute_returns(df: pd.DataFrame,
     # NaN 제외한 실제 수익률로 std 계산
     annual_vol = daily_ret.std() * math.sqrt(annualization_days)
 
-    # [FIX] 극소값 방어 (부동소수점 오차 대비)
+    # 극소값 방어 (부동소수점 오차 대비)
     if annual_vol > 1e-8:
         sharpe = (annual_ret - risk_free_rate) / annual_vol
     else:
@@ -474,7 +618,7 @@ def compute_returns(df: pd.DataFrame,
 
     roll_max = cum_ret.cummax()
     drawdown = (cum_ret - roll_max) / roll_max
-    mdd = drawdown.min()  # 음수값. 리포트에서 *100하면 음수 퍼센트
+    mdd      = drawdown.min()   # 음수값; 리포트에서 *100 하면 음수 퍼센트
 
     return {
         "daily_return":       daily_ret,
@@ -488,80 +632,132 @@ def compute_returns(df: pd.DataFrame,
 
 
 # ──────────────────────────────────────────────
-# 3단계. 기술적 지표
+# 벤치마크 비교
+# [FIX 2차 H-2 / B-1] 기술지표 섹션에서 독립 분리
 # ──────────────────────────────────────────────
 
+def _fetch_one_benchmark(benchmark: str,
+                         start: str,
+                         end: str,
+                         risk_free_rate: float,
+                         annualization_days: int,
+                         corr_window: int,
+                         target_cum: pd.Series,
+                         target_daily: pd.Series,
+                         target_total_return: float) -> dict:
+    """
+    단일 벤치마크 데이터 수집 + 통계 계산 (ThreadPoolExecutor 내 실행용).
+
+    [FIX 1차 B-5] rolling_corr.dropna() 이중 계산 → 단일 변수로 통합
+    """
+    try:
+        bm_df    = fetch_data(benchmark, start=start, end=end)
+        bm_stats = compute_returns(bm_df,
+                                   risk_free_rate=risk_free_rate,
+                                   annualization_days=annualization_days)
+        total_return = float(bm_stats["cumulative_return"].iloc[-1] - 1)
+
+        aligned_cum = pd.concat(
+            [target_cum.rename("target"),
+             bm_stats["cumulative_return"].rename("benchmark")],
+            axis=1,
+        ).ffill().dropna()
+        excess_return_series = aligned_cum["target"] - aligned_cum["benchmark"]
+
+        aligned_daily = pd.concat(
+            [target_daily.rename("target"),
+             bm_stats["daily_return"].rename("benchmark")],
+            axis=1,
+        ).dropna()
+        rolling_corr = aligned_daily["target"].rolling(corr_window).corr(
+            aligned_daily["benchmark"]
+        )
+        # [FIX 1차 B-5] dropna() 한 번만 호출
+        _corr_valid  = rolling_corr.dropna()
+        latest_corr  = None if _corr_valid.empty else float(_corr_valid.iloc[-1])
+
+        return {
+            "ticker":               benchmark,
+            "total_return":         total_return,
+            "annual_return":        float(bm_stats["annual_return"]),
+            "mdd":                  float(bm_stats["mdd"]),
+            "excess_return":        target_total_return - total_return,
+            "cumulative_return":    bm_stats["cumulative_return"],
+            "excess_return_series": excess_return_series,
+            "rolling_corr":         rolling_corr,
+            "corr_window":          corr_window,
+            "latest_corr":          latest_corr,
+            "error":                None,
+        }
+    except Exception as exc:
+        return {
+            "ticker":               benchmark,
+            "total_return":         None,
+            "annual_return":        None,
+            "mdd":                  None,
+            "excess_return":        None,
+            "cumulative_return":    None,
+            "excess_return_series": None,
+            "rolling_corr":         None,
+            "corr_window":          corr_window,
+            "latest_corr":          None,
+            "error":                str(exc),
+        }
+
+
 def compute_benchmark_comparison(target_stats: dict,
-                                 start: str,
-                                 end: str,
-                                 risk_free_rate: float = 0.03,
-                                 annualization_days: int = 252,
-                                 benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS,
-                                 corr_window: int = 60) -> list[dict]:
+                                  start: str,
+                                  end: str,
+                                  risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+                                  annualization_days: int = 252,
+                                  benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS,
+                                  corr_window: int = 60) -> list[dict]:
     """
-    Compare target return metrics with simple market benchmarks.
+    대상 종목 수익률 지표를 시장 벤치마크와 비교한다.
 
-    Benchmark fetch failures are kept in the returned rows so the main analysis
-    can continue even when an external data source is temporarily unavailable.
+    벤치마크 수집 실패는 error 필드로 기록하며 전체 분석을 중단하지 않는다.
+
+    [FIX 2차 C-2] 벤치마크 순차 fetch → ThreadPoolExecutor 병렬 수집
     """
+    if not benchmarks:
+        return []
+
     target_total_return = float(target_stats["cumulative_return"].iloc[-1] - 1)
-    target_cum = target_stats["cumulative_return"]
-    target_daily = target_stats["daily_return"]
-    rows: list[dict] = []
+    target_cum          = target_stats["cumulative_return"]
+    target_daily        = target_stats["daily_return"]
 
-    for benchmark in benchmarks:
-        try:
-            bm_df = fetch_data(benchmark, start=start, end=end)
-            bm_stats = compute_returns(
-                bm_df,
-                risk_free_rate=risk_free_rate,
-                annualization_days=annualization_days,
-            )
-            total_return = float(bm_stats["cumulative_return"].iloc[-1] - 1)
-            aligned_cum = pd.concat(
-                [target_cum.rename("target"), bm_stats["cumulative_return"].rename("benchmark")],
-                axis=1,
-            ).ffill().dropna()
-            excess_return_series = aligned_cum["target"] - aligned_cum["benchmark"]
-            aligned_daily = pd.concat(
-                [target_daily.rename("target"), bm_stats["daily_return"].rename("benchmark")],
-                axis=1,
-            ).dropna()
-            rolling_corr = aligned_daily["target"].rolling(corr_window).corr(aligned_daily["benchmark"])
-            latest_corr = rolling_corr.dropna().iloc[-1] if not rolling_corr.dropna().empty else None
-            rows.append({
-                "ticker": benchmark,
-                "total_return": total_return,
-                "annual_return": float(bm_stats["annual_return"]),
-                "mdd": float(bm_stats["mdd"]),
-                "excess_return": target_total_return - total_return,
-                "cumulative_return": bm_stats["cumulative_return"],
-                "excess_return_series": excess_return_series,
-                "rolling_corr": rolling_corr,
-                "corr_window": corr_window,
-                "latest_corr": None if latest_corr is None else float(latest_corr),
-                "error": None,
-            })
-        except Exception as exc:
-            rows.append({
-                "ticker": benchmark,
-                "total_return": None,
-                "annual_return": None,
-                "mdd": None,
-                "excess_return": None,
-                "cumulative_return": None,
-                "excess_return_series": None,
-                "rolling_corr": None,
-                "corr_window": corr_window,
-                "latest_corr": None,
-                "error": str(exc),
-            })
+    # 공통 kwargs
+    kwargs = dict(
+        start=start,
+        end=end,
+        risk_free_rate=risk_free_rate,
+        annualization_days=annualization_days,
+        corr_window=corr_window,
+        target_cum=target_cum,
+        target_daily=target_daily,
+        target_total_return=target_total_return,
+    )
 
-    return rows
+    # 병렬 fetch (I/O bound 작업; GIL 영향 없음)
+    results: dict[str, dict] = {}
+    max_workers = min(len(benchmarks), 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_fetch_one_benchmark, bm, **kwargs): bm
+            for bm in benchmarks
+        }
+        for future in as_completed(futures):
+            bm             = futures[future]
+            results[bm]    = future.result()
+
+    # 입력 순서 유지
+    return [results[bm] for bm in benchmarks]
 
 
-def print_benchmark_report(ticker: str, target_stats: dict, benchmark_rows: list[dict]) -> None:
-    """Print a compact benchmark comparison table."""
+def print_benchmark_report(ticker: str,
+                            target_stats: dict,
+                            benchmark_rows: list[dict]) -> None:
+    """벤치마크 비교 테이블을 콘솔에 출력."""
     target_total_return = float(target_stats["cumulative_return"].iloc[-1] - 1)
     sep = "-" * 60
 
@@ -578,7 +774,6 @@ def print_benchmark_report(ticker: str, target_stats: dict, benchmark_rows: list
             print(f"  {row['ticker']:<8} {'N/A':>10} {'N/A':>10} {'N/A':>10} {'N/A':>10}")
             print(f"    - 비교 불가: {row['error']}")
             continue
-
         print(f"  {row['ticker']:<8} {row['total_return']*100:>9.2f}% "
               f"{row['annual_return']*100:>9.2f}% "
               f"{row['mdd']*100:>9.2f}% "
@@ -586,6 +781,10 @@ def print_benchmark_report(ticker: str, target_stats: dict, benchmark_rows: list
         corr_text = "N/A" if row["latest_corr"] is None else f"{row['latest_corr']:.2f}"
         print(f"    {row['corr_window']}D rolling correlation: {corr_text}")
 
+
+# ──────────────────────────────────────────────
+# 3단계. 기술적 지표
+# ──────────────────────────────────────────────
 
 def compute_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     """5/20/60/120일 이동평균선 및 골든/데드 크로스 시그널 추가."""
@@ -606,35 +805,36 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     """
     RSI 계산 (Wilder's smoothing) 및 buy/sell/neutral 시그널 추가.
 
-    Wilder's RSI: alpha = 1/period (ewm com = period-1)
+    Wilder's RSI: alpha = 1/period  (ewm com = period - 1)
+
+    세 가지 케이스:
+      avg_gain > 0, avg_loss = 0 → RSI = 100 (상승만 존재)
+      avg_gain = 0, avg_loss = 0 → RSI = 50  (flat, 중립)
+      avg_gain = 0, avg_loss > 0 → RSI = 0   (하락만 존재, 정상 공식)
+      NaN (워밍업 미완료)         → RSI = NaN
     """
-    delta = df["Close"].diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
+    delta    = df["Close"].diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
 
-    # [FIX] 세 가지 케이스 명확 분리
-    #   avg_gain > 0, avg_loss = 0 → RSI = 100 (상승만 존재)
-    #   avg_gain = 0, avg_loss = 0 → RSI = 50  (flat price, 중립)
-    #   avg_gain = 0, avg_loss > 0 → RSI = 0   (하락만 존재, 정상 공식)
-    #   NaN (워밍업 미완료)       → RSI = NaN
     with np.errstate(divide="ignore", invalid="ignore"):
         both_zero = (avg_gain == 0) & (avg_loss == 0)
         rs = np.where(avg_loss == 0, np.inf, avg_gain.values / avg_loss.values)
+
     rsi_vals = np.where(
         both_zero,
-        50.0,                                          # flat price → 중립
-        np.where(np.isinf(rs), 100.0,
-                 100.0 - (100.0 / (1.0 + rs)))
+        50.0,
+        np.where(np.isinf(rs), 100.0, 100.0 - (100.0 / (1.0 + rs)))
     )
     rsi = pd.Series(rsi_vals, index=df.index)
-    # 워밍업 구간(avg_gain/avg_loss가 NaN) → RSI도 NaN 유지
+    # 워밍업 구간 (avg_gain/avg_loss 가 NaN) → RSI 도 NaN 유지
     rsi = rsi.where(avg_gain.notna() & avg_loss.notna(), other=np.nan)
 
     df["RSI"] = rsi
-    # [FIX] RSI NaN 구간은 "" 처리 (기존 "neutral" 오표기 방지)
+    # RSI NaN 구간은 "" 처리 (기존 "neutral" 오표기 방지)
     df["RSI_Signal"] = np.where(
         rsi.isna(), "",
         np.where(rsi >= 70, "sell",
@@ -645,7 +845,13 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 def compute_macd(df: pd.DataFrame,
                  fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    """MACD Line, Signal Line, Histogram 및 크로스 시그널 추가."""
+    """
+    MACD Line, Signal Line, Histogram 및 크로스 시그널 추가.
+
+    Note: adjust=False EMA 특성상 초기(slow 기간 이전) 값은 수렴이 덜 됨.
+          워밍업 구간에 대한 별도 NaN 처리는 수행하지 않음 (거래 시그널에는
+          min_periods 가 없어 미미한 영향이지만 극초기 구간 해석 주의).
+    """
     ema_fast    = df["Close"].ewm(span=fast,   adjust=False).mean()
     ema_slow    = df["Close"].ewm(span=slow,   adjust=False).mean()
     macd_line   = ema_fast - ema_slow
@@ -663,7 +869,8 @@ def compute_macd(df: pd.DataFrame,
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """모든 기술적 지표를 DataFrame에 추가."""
+    """모든 기술적 지표를 DataFrame 에 추가. 원본 복사 후 반환."""
+    # copy(): 외부에서 전달된 df 원본 보호 (compute_* 함수들이 인플레이스 대입)
     df = df.copy()
     df = compute_moving_averages(df)
     df = compute_rsi(df)
@@ -679,17 +886,17 @@ def summarize_current_state(df: pd.DataFrame) -> dict:
     빠르게 확인하기 위한 보조 정보다.
     """
     latest = df.iloc[-1]
-    close = float(latest["Close"])
-    ma20  = latest.get("MA20", np.nan)
-    ma60  = latest.get("MA60", np.nan)
-    ma120 = latest.get("MA120", np.nan)
-    rsi   = latest.get("RSI", np.nan)
-    macd  = latest.get("MACD", np.nan)
-    signal = latest.get("MACD_Signal", np.nan)
+    close  = float(latest["Close"])
+    ma20   = latest.get("MA20",        np.nan)
+    ma60   = latest.get("MA60",        np.nan)
+    ma120  = latest.get("MA120",       np.nan)
+    rsi    = latest.get("RSI",         np.nan)
+    macd   = latest.get("MACD",        np.nan)
+    sig    = latest.get("MACD_Signal", np.nan)
 
     price_position = {
-        "above_ma20":  bool(pd.notna(ma20) and close > ma20),
-        "above_ma60":  bool(pd.notna(ma60) and close > ma60),
+        "above_ma20":  bool(pd.notna(ma20)  and close > ma20),
+        "above_ma60":  bool(pd.notna(ma60)  and close > ma60),
         "above_ma120": bool(pd.notna(ma120) and close > ma120),
     }
 
@@ -711,9 +918,9 @@ def summarize_current_state(df: pd.DataFrame) -> dict:
     else:
         rsi_state = "중립~약세"
 
-    if pd.isna(macd) or pd.isna(signal):
+    if pd.isna(macd) or pd.isna(sig):
         macd_state = "판단 보류"
-    elif macd > signal:
+    elif macd > sig:
         macd_state = "상승 모멘텀"
     else:
         macd_state = "하락/둔화 모멘텀"
@@ -722,30 +929,32 @@ def summarize_current_state(df: pd.DataFrame) -> dict:
         price_position["above_ma20"],
         price_position["above_ma60"],
         bool(pd.notna(ma20) and pd.notna(ma60) and ma20 > ma60),
-        bool(pd.notna(macd) and pd.notna(signal) and macd > signal),
-        bool(pd.notna(rsi) and 40 <= rsi <= 70),
+        bool(pd.notna(macd) and pd.notna(sig)  and macd > sig),
+        bool(pd.notna(rsi)  and 40 <= rsi <= 70),
     ]
     signal_score = sum(score_checks)
 
     return {
-        "date": df.index[-1],
-        "close": close,
-        "trend": trend,
-        "price_position": price_position,
-        "rsi": None if pd.isna(rsi) else float(rsi),
-        "rsi_state": rsi_state,
-        "macd": None if pd.isna(macd) else float(macd),
-        "macd_signal": None if pd.isna(signal) else float(signal),
-        "macd_state": macd_state,
-        "signal_score": signal_score,
+        "date":             df.index[-1],
+        "close":            close,
+        "trend":            trend,
+        "price_position":   price_position,
+        "rsi":              None if pd.isna(rsi)  else float(rsi),
+        "rsi_state":        rsi_state,
+        "macd":             None if pd.isna(macd) else float(macd),
+        "macd_signal":      None if pd.isna(sig)  else float(sig),
+        "macd_state":       macd_state,
+        "signal_score":     signal_score,
         "signal_score_max": len(score_checks),
     }
 
 
 def print_current_state(summary: dict, ticker: str) -> None:
     """현재 기술적 상태 요약을 콘솔에 출력."""
-    date = summary["date"].strftime("%Y-%m-%d") if hasattr(summary["date"], "strftime") else str(summary["date"])
-    price = summary["price_position"]
+    date = (summary["date"].strftime("%Y-%m-%d")
+            if hasattr(summary["date"], "strftime")
+            else str(summary["date"]))
+    price    = summary["price_position"]
     rsi_text = "N/A" if summary["rsi"] is None else f"{summary['rsi']:.1f}"
 
     print(f"\n[ 현재 상태 요약 | {ticker} | {date} ]")
@@ -765,11 +974,9 @@ def print_current_state(summary: dict, ticker: str) -> None:
 # ──────────────────────────────────────────────
 
 def _format_current_state_annotation(summary: dict) -> str:
-    """
-    Return a compact HTML-safe summary for the dashboard header area.
-    """
-    rsi = summary.get("rsi")
-    rsi_text = "N/A" if rsi is None or pd.isna(rsi) else f"{rsi:.1f}"
+    """대시보드 헤더용 현재 상태 요약 HTML 문자열."""
+    rsi      = summary.get("rsi")
+    rsi_text = "N/A" if (rsi is None or pd.isna(rsi)) else f"{rsi:.1f}"
     return (
         f"<b>현재 상태</b>: {summary.get('trend', 'N/A')} | "
         f"RSI {rsi_text} ({summary.get('rsi_state', 'N/A')}) | "
@@ -779,187 +986,269 @@ def _format_current_state_annotation(summary: dict) -> str:
 
 
 def _format_benchmark_annotation(benchmark_rows: list[dict] | None) -> str | None:
-    """Return a compact benchmark comparison summary for the dashboard."""
+    """대시보드 헤더용 벤치마크 비교 요약 HTML 문자열."""
     if not benchmark_rows:
         return None
-
     parts = []
     for row in benchmark_rows:
         if row.get("error"):
             parts.append(f"{row['ticker']} N/A")
         else:
-            corr = row.get("latest_corr")
-            corr_text = "N/A" if corr is None else f"{corr:.2f}"
+            corr       = row.get("latest_corr")
+            corr_text  = "N/A" if corr is None else f"{corr:.2f}"
             corr_window = row.get("corr_window", 60)
-            parts.append(f"{row['ticker']} 초과 {row['excess_return']*100:+.2f}% / {corr_window}D상관 {corr_text}")
-
+            parts.append(
+                f"{row['ticker']} 초과 {row['excess_return']*100:+.2f}% "
+                f"/ {corr_window}D상관 {corr_text}"
+            )
     return "<b>벤치마크</b>: " + " | ".join(parts)
 
 
-def plot_dashboard(df: pd.DataFrame,
-                   ticker: str,
-                   stats: dict,
-                   current_state: dict | None = None,
-                   benchmark_comparison: list[dict] | None = None,
-                   show_excess_return: bool = True,
-                   benchmark_display: str = "all",
-                   show_marker_legend: bool = True):
-    """
-    Plotly 서브플롯 대시보드 (캔들 + MA, 거래량, RSI, MACD).
-    """
-    fig = make_subplots(
-        rows=5, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.38, 0.13, 0.17, 0.17, 0.15],
-        vertical_spacing=0.03,
-        subplot_titles=[
-            f"{ticker} 캔들스틱 + 이동평균선",
-            "거래량",
-            "RSI (14)",
-            "MACD (12/26/9)",
-            "누적수익률 비교"
-        ]
+def _format_strategy_annotation(strategy_summary: dict | None) -> str | None:
+    """대시보드 헤더용 백테스트 우위 전략 요약 HTML 문자열."""
+    if not strategy_summary:
+        return None
+    return (
+        f"<b>전략</b>: 우위 {strategy_summary['winner']} | "
+        f"수익률 차이 {strategy_summary['return_diff']*100:+.2f}% | "
+        f"샤프 차이 {strategy_summary['sharpe_diff']:+.2f}"
     )
 
-    # ── 차트1: 캔들스틱 ──
-    # [FIX] fillcolor 명시 (line color만 설정 시 캔들 몸통이 기본값으로 표시되는 문제)
+
+def _format_data_warning_annotation(data_quality: dict | None) -> str | None:
+    """대시보드 헤더용 데이터 품질 경고 요약 HTML 문자열."""
+    if not data_quality or not data_quality.get("checked"):
+        return None
+    warnings = data_quality.get("warnings") or []
+    if not warnings:
+        return None
+    return (
+        "<span style='color:#FFB74D'><b>데이터 주의</b>: "
+        + ", ".join(warnings)
+        + "</span>"
+    )
+
+
+def _format_dashboard_summary_annotation(current_state: dict | None,
+                                         stats: dict,
+                                         benchmark_rows: list[dict] | None,
+                                         strategy_summary: dict | None,
+                                         data_quality: dict | None = None) -> str:
+    """상단 대시보드 요약을 현재 상태·성과·벤치마크/전략 줄로 구분한다."""
+    parts = []
+    if current_state:
+        parts.append(_format_current_state_annotation(current_state))
+
+    parts.append(
+        f"<b>성과</b>: 연수익률 {stats['annual_return']*100:+.2f}% | "
+        f"연변동성 {stats['annual_volatility']*100:.2f}% | "
+        f"Sharpe {stats['sharpe_ratio']:.2f} | "
+        f"MDD {stats['mdd']*100:.2f}%"
+    )
+
+    benchmark_annotation = _format_benchmark_annotation(benchmark_rows)
+    if benchmark_annotation:
+        parts.append(benchmark_annotation)
+
+    strategy_annotation = _format_strategy_annotation(strategy_summary)
+    if strategy_annotation:
+        parts.append(strategy_annotation)
+
+    data_warning_annotation = _format_data_warning_annotation(data_quality)
+    if data_warning_annotation:
+        parts.append(data_warning_annotation)
+
+    return "<br>".join(parts)
+
+
+# ── 차트 패널 빌더 (내부 헬퍼)
+# [FIX 2차 A-2] plot_dashboard 249줄 단일 함수 → 패널별 분리
+
+def _add_candle_panel(fig,
+                      df: pd.DataFrame,
+                      show_marker_legend: bool,
+                      show_signal_markers: bool) -> None:
+    """차트1: 캔들스틱 + 이동평균선 + 골든/데드 크로스 마커."""
     fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"],
-        low=df["Low"],  close=df["Close"],
+        x=df.index,
+        open=df["Open"], high=df["High"],
+        low=df["Low"],   close=df["Close"],
         name="캔들",
+        legendgroup="price",
+        legendgrouptitle_text="가격",
         increasing_line_color="#EF5350",
         increasing_fillcolor="rgba(239,83,80,0.85)",
         decreasing_line_color="#26A69A",
         decreasing_fillcolor="rgba(38,166,154,0.85)",
     ), row=1, col=1)
 
-    # [FIX] MA120 색상을 #EF5350(캔들 상승색)과 구분되게 변경
-    ma_colors = {
-        "MA5":   "#FFA726",  # 주황
-        "MA20":  "#42A5F5",  # 파랑
-        "MA60":  "#AB47BC",  # 보라
-        "MA120": "#EC407A",  # 핑크 (기존 빨강 → 캔들 상승색과 혼동 방지)
-    }
-    for ma, color in ma_colors.items():
+    # [FIX 2차 A-3] MA_COLORS 모듈 상수 사용
+    for ma, color in MA_COLORS.items():
         if ma in df.columns:
             fig.add_trace(go.Scatter(
                 x=df.index, y=df[ma], name=ma,
-                line=dict(color=color, width=1.2), opacity=0.85
+                line=dict(color=color, width=1.2), opacity=0.85,
+                legendgroup="price",
             ), row=1, col=1)
 
-    # [FIX] 골든/데드 크로스 마커: NaN MA20 행 제거 후 표시
-    golden = df[(df["MA_Signal"] == "golden") & df["MA20"].notna()]
-    dead   = df[(df["MA_Signal"] == "dead")   & df["MA20"].notna()]
-    if not golden.empty:
-        fig.add_trace(go.Scatter(
-            x=golden.index, y=golden["MA20"],
-            mode="markers", marker=dict(symbol="triangle-up", size=12, color="#00E676"),
-            name="골든크로스",
-            showlegend=show_marker_legend,
-        ), row=1, col=1)
-    if not dead.empty:
-        fig.add_trace(go.Scatter(
-            x=dead.index, y=dead["MA20"],
-            mode="markers", marker=dict(symbol="triangle-down", size=12, color="#FF1744"),
-            name="데드크로스",
-            showlegend=show_marker_legend,
-        ), row=1, col=1)
+    if show_signal_markers:
+        golden = df[(df["MA_Signal"] == "golden") & df["MA20"].notna()]
+        dead   = df[(df["MA_Signal"] == "dead")   & df["MA20"].notna()]
+        if not golden.empty:
+            fig.add_trace(go.Scatter(
+                x=golden.index, y=golden["MA20"],
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=12, color="#00E676"),
+                name="골든크로스", showlegend=show_marker_legend,
+                legendgroup="price",
+            ), row=1, col=1)
+        if not dead.empty:
+            fig.add_trace(go.Scatter(
+                x=dead.index, y=dead["MA20"],
+                mode="markers",
+                marker=dict(symbol="triangle-down", size=12, color="#FF1744"),
+                name="데드크로스", showlegend=show_marker_legend,
+                legendgroup="price",
+            ), row=1, col=1)
 
-    # ── 차트2: 거래량 ──
-    vol_colors = ["#EF5350" if c >= o else "#26A69A"
-                  for c, o in zip(df["Close"], df["Open"])]
+
+def _add_volume_panel(fig, df: pd.DataFrame) -> None:
+    """차트2: 거래량 바.
+
+    [FIX 2차 C-3] Python 리스트 컴프리헨션 → np.where 벡터화
+    """
+    vol_colors = np.where(
+        df["Close"].values >= df["Open"].values, "#EF5350", "#26A69A"
+    )
     fig.add_trace(go.Bar(
         x=df.index, y=df["Volume"], name="거래량",
-        marker_color=vol_colors, opacity=0.7
+        marker_color=vol_colors, opacity=0.7,
+        legendgroup="volume",
+        legendgrouptitle_text="거래량",
     ), row=2, col=1)
 
-    # ── 차트3: RSI ──
-    # [FIX] NaN 구간 제거하여 그래프 끊김 방지
+
+def _add_rsi_panel(fig,
+                   df: pd.DataFrame,
+                   show_marker_legend: bool,
+                   show_signal_markers: bool) -> None:
+    """차트3: RSI + 기준선 + 시그널 마커."""
     rsi_valid = df["RSI"].dropna()
     fig.add_trace(go.Scatter(
         x=rsi_valid.index, y=rsi_valid, name="RSI",
-        line=dict(color="#FF9800", width=1.5)
+        line=dict(color="#FF9800", width=1.5),
+        legendgroup="indicator",
+        legendgrouptitle_text="지표",
     ), row=3, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="red",  opacity=0.6, row=3, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="blue", opacity=0.6, row=3, col=1)
     fig.add_hline(y=50, line_dash="dot",  line_color="gray", opacity=0.4, row=3, col=1)
 
-    # [FIX] RSI 시그널 마커: RSI NaN 제외
-    rsi_buy  = df[(df["RSI_Signal"] == "buy")  & df["RSI"].notna()]
-    rsi_sell = df[(df["RSI_Signal"] == "sell") & df["RSI"].notna()]
-    if not rsi_buy.empty:
-        fig.add_trace(go.Scatter(
-            x=rsi_buy.index, y=rsi_buy["RSI"],
-            mode="markers", marker=dict(symbol="triangle-up", size=10, color="#00BCD4"),
-            name="RSI 매수",
-            showlegend=show_marker_legend,
-        ), row=3, col=1)
-    if not rsi_sell.empty:
-        fig.add_trace(go.Scatter(
-            x=rsi_sell.index, y=rsi_sell["RSI"],
-            mode="markers", marker=dict(symbol="triangle-down", size=10, color="#E91E63"),
-            name="RSI 매도",
-            showlegend=show_marker_legend,
-        ), row=3, col=1)
+    if show_signal_markers:
+        rsi_buy  = df[(df["RSI_Signal"] == "buy")  & df["RSI"].notna()]
+        rsi_sell = df[(df["RSI_Signal"] == "sell") & df["RSI"].notna()]
+        if not rsi_buy.empty:
+            fig.add_trace(go.Scatter(
+                x=rsi_buy.index, y=rsi_buy["RSI"],
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=10, color="#00BCD4"),
+                name="RSI 매수", showlegend=show_marker_legend,
+                legendgroup="indicator",
+            ), row=3, col=1)
+        if not rsi_sell.empty:
+            fig.add_trace(go.Scatter(
+                x=rsi_sell.index, y=rsi_sell["RSI"],
+                mode="markers",
+                marker=dict(symbol="triangle-down", size=10, color="#E91E63"),
+                name="RSI 매도", showlegend=show_marker_legend,
+                legendgroup="indicator",
+            ), row=3, col=1)
 
-    # ── 차트4: MACD ──
+
+def _add_macd_panel(fig,
+                    df: pd.DataFrame,
+                    show_marker_legend: bool,
+                    show_signal_markers: bool) -> None:
+    """차트4: MACD + Signal + 히스토그램 + 크로스 마커.
+
+    [FIX 2차 C-3] 히스토그램 색상 리스트 컴프리헨션 → np.where 벡터화
+    """
     fig.add_trace(go.Scatter(
         x=df.index, y=df["MACD"], name="MACD",
-        line=dict(color="#2196F3", width=1.5)
+        line=dict(color="#2196F3", width=1.5),
+        legendgroup="indicator",
     ), row=4, col=1)
     fig.add_trace(go.Scatter(
         x=df.index, y=df["MACD_Signal"], name="Signal",
-        line=dict(color="#FF5722", width=1.5)
+        line=dict(color="#FF5722", width=1.5),
+        legendgroup="indicator",
     ), row=4, col=1)
 
-    hist_colors = ["#EF5350" if v >= 0 else "#26A69A"
-                   for v in df["MACD_Hist"].fillna(0)]
+    hist_colors = np.where(
+        df["MACD_Hist"].fillna(0).values >= 0, "#EF5350", "#26A69A"
+    )
     fig.add_trace(go.Bar(
         x=df.index, y=df["MACD_Hist"], name="히스토그램",
-        marker_color=hist_colors, opacity=0.6
+        marker_color=hist_colors, opacity=0.6,
+        legendgroup="indicator",
     ), row=4, col=1)
 
-    # [FIX] MACD 크로스 마커: NaN MACD 행 제거
-    macd_golden = df[(df["MACD_Cross"] == "golden") & df["MACD"].notna()]
-    macd_dead   = df[(df["MACD_Cross"] == "dead")   & df["MACD"].notna()]
-    if not macd_golden.empty:
-        fig.add_trace(go.Scatter(
-            x=macd_golden.index, y=macd_golden["MACD"],
-            mode="markers", marker=dict(symbol="triangle-up", size=10, color="#00E676"),
-            name="MACD 골든",
-            showlegend=show_marker_legend,
-        ), row=4, col=1)
-    if not macd_dead.empty:
-        fig.add_trace(go.Scatter(
-            x=macd_dead.index, y=macd_dead["MACD"],
-            mode="markers", marker=dict(symbol="triangle-down", size=10, color="#FF1744"),
-            name="MACD 데드",
-            showlegend=show_marker_legend,
-        ), row=4, col=1)
+    if show_signal_markers:
+        macd_golden = df[(df["MACD_Cross"] == "golden") & df["MACD"].notna()]
+        macd_dead   = df[(df["MACD_Cross"] == "dead")   & df["MACD"].notna()]
+        if not macd_golden.empty:
+            fig.add_trace(go.Scatter(
+                x=macd_golden.index, y=macd_golden["MACD"],
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=10, color="#00E676"),
+                name="MACD 골든", showlegend=show_marker_legend,
+                legendgroup="indicator",
+            ), row=4, col=1)
+        if not macd_dead.empty:
+            fig.add_trace(go.Scatter(
+                x=macd_dead.index, y=macd_dead["MACD"],
+                mode="markers",
+                marker=dict(symbol="triangle-down", size=10, color="#FF1744"),
+                name="MACD 데드", showlegend=show_marker_legend,
+                legendgroup="indicator",
+            ), row=4, col=1)
 
-    # ── 레이아웃 ──
+
+def _add_cum_return_panel(fig,
+                           df: pd.DataFrame,
+                           ticker: str,
+                           stats: dict,
+                           benchmark_comparison: list[dict] | None,
+                           show_cumulative_lines: bool,
+                           show_excess_lines: bool,
+                           show_benchmark_legend: bool) -> None:
+    """차트5: 대상 + 벤치마크 누적수익률 비교."""
     target_cum_pct = (stats["cumulative_return"] - 1) * 100
-    show_cumulative_lines = benchmark_display in ("all", "cumulative")
-    show_excess_lines = show_excess_return and benchmark_display in ("all", "excess")
+
     if show_cumulative_lines:
         fig.add_trace(go.Scatter(
-            x=target_cum_pct.index,
-            y=target_cum_pct,
+            x=target_cum_pct.index, y=target_cum_pct,
             name=f"{ticker} 누적수익률",
             line=dict(color="#FFFFFF", width=2.0),
+            showlegend=show_benchmark_legend,
+            legendgroup="benchmark",
+            legendgrouptitle_text="벤치마크",
         ), row=5, col=1)
 
-    benchmark_colors = ["#00BCD4", "#FFD54F", "#A5D6A7", "#CE93D8"]
     for idx, row in enumerate(benchmark_comparison or []):
         series = row.get("cumulative_return")
         if row.get("error") or series is None:
             continue
+        color = BENCHMARK_LINE_COLORS[idx % len(BENCHMARK_LINE_COLORS)]
+
         if show_cumulative_lines:
             fig.add_trace(go.Scatter(
                 x=series.index,
                 y=(series - 1) * 100,
                 name=f"{row['ticker']} 누적수익률",
-                line=dict(color=benchmark_colors[idx % len(benchmark_colors)], width=1.5, dash="dot"),
+                line=dict(color=color, width=1.5, dash="dot"),
+                showlegend=show_benchmark_legend,
+                legendgroup="benchmark",
             ), row=5, col=1)
 
         excess_series = row.get("excess_return_series")
@@ -968,78 +1257,105 @@ def plot_dashboard(df: pd.DataFrame,
                 x=excess_series.index,
                 y=excess_series * 100,
                 name=f"{ticker} vs {row['ticker']} 초과수익",
-                line=dict(color=benchmark_colors[idx % len(benchmark_colors)], width=1.2, dash="dash"),
+                line=dict(color=color, width=1.2, dash="dash"),
                 opacity=0.75,
+                showlegend=show_benchmark_legend,
+                legendgroup="benchmark",
             ), row=5, col=1)
 
+
+def plot_dashboard(df: pd.DataFrame,
+                   ticker: str,
+                   stats: dict,
+                   current_state: dict | None = None,
+                   benchmark_comparison: list[dict] | None = None,
+                   show_excess_return: bool = True,
+                   benchmark_display: str = "cumulative",
+                   show_marker_legend: bool = True,
+                   show_signal_markers: bool = True,
+                   strategy_summary: dict | None = None,
+                   data_quality: dict | None = None,
+                   show_benchmark_legend: bool = False):
+    """
+    Plotly 서브플롯 대시보드 (캔들+MA, 거래량, RSI, MACD, 누적수익률).
+
+    [FIX 2차 A-2] 249줄 단일 함수 → _add_*_panel 헬퍼로 분리
+    """
+    fig = make_subplots(
+        rows=5, cols=1,
+        shared_xaxes=True,
+        row_heights=list(CHART_ROW_HEIGHTS),
+        vertical_spacing=0.03,
+        subplot_titles=[
+            f"{ticker} 캔들스틱 + 이동평균선",
+            "거래량",
+            "RSI (14)",
+            "MACD (12/26/9)",
+            "누적수익률 비교",
+        ],
+    )
+
+    _add_candle_panel(fig, df, show_marker_legend, show_signal_markers)
+    _add_volume_panel(fig, df)
+    _add_rsi_panel(fig, df, show_marker_legend, show_signal_markers)
+    _add_macd_panel(fig, df, show_marker_legend, show_signal_markers)
+
+    show_cumulative_lines = benchmark_display in ("all", "cumulative")
+    show_excess_lines     = show_excess_return and benchmark_display in ("all", "excess")
+    _add_cum_return_panel(fig, df, ticker, stats, benchmark_comparison,
+                          show_cumulative_lines, show_excess_lines,
+                          show_benchmark_legend)
+
+    # ── 레이아웃 ──
     annual_ret_pct = stats["annual_return"]    * 100
     annual_vol_pct = stats["annual_volatility"] * 100
-    mdd_pct        = stats["mdd"]              * 100  # 음수
+    mdd_pct        = stats["mdd"]              * 100
 
-    benchmark_annotation = _format_benchmark_annotation(benchmark_comparison)
-    top_margin = 145 if current_state and benchmark_annotation else 120 if current_state or benchmark_annotation else 90
+    dashboard_summary = _format_dashboard_summary_annotation(
+        current_state, stats, benchmark_comparison, strategy_summary, data_quality
+    )
+    # [FIX 2차 A-3] 인라인 매직 넘버 → CHART_MARGIN_* 상수
+    top_margin = CHART_MARGIN_ONE if dashboard_summary else CHART_MARGIN_NONE
 
     fig.update_layout(
         title=dict(
-            text=(f"<b>{ticker} 주식 분석 대시보드</b>  |  "
-                  f"연수익률: {annual_ret_pct:+.2f}%  |  "
-                  f"연변동성: {annual_vol_pct:.2f}%  |  "
-                  f"Sharpe: {stats['sharpe_ratio']:.2f}  |  "
-                  f"MDD: {mdd_pct:.2f}%"),
-            font=dict(size=14)
+            text=f"<b>{ticker} 주식 분석 대시보드</b>",
+            font=dict(size=15),
         ),
         height=1120,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                    xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.005,
+            xanchor="right",
+            x=1,
+            font=dict(size=11),
+        ),
         hovermode="x unified",
-        margin=dict(l=60, r=40, t=top_margin, b=40)
+        margin=dict(l=60, r=40, t=top_margin, b=40),
     )
 
-    fig.update_yaxes(title_text="주가",  row=1, col=1)
-    fig.update_yaxes(title_text="거래량", row=2, col=1)
-    fig.update_yaxes(title_text="RSI",   row=3, col=1, range=[0, 100])
-    fig.update_yaxes(title_text="MACD",  row=4, col=1)
+    fig.update_yaxes(title_text="주가",        row=1, col=1)
+    fig.update_yaxes(title_text="거래량",       row=2, col=1)
+    fig.update_yaxes(title_text="RSI",          row=3, col=1, range=[0, 100])
+    fig.update_yaxes(title_text="MACD",         row=4, col=1)
     fig.update_yaxes(title_text="누적수익률(%)", row=5, col=1)
 
-    # [FIX] 주식만 주말 갭 제거 (암호화폐·24시간 자산은 주말 데이터 존재 → 적용 제외)
-    if benchmark_annotation:
+    # 현재 상태·성과·벤치마크·전략 요약 어노테이션
+    if dashboard_summary:
         fig.add_annotation(
-            text=benchmark_annotation,
-            xref="paper",
-            yref="paper",
-            x=0,
-            y=1.04,
-            xanchor="left",
-            yanchor="bottom",
-            showarrow=False,
-            align="left",
-            font=dict(size=12, color="#F5F5F5"),
-            bgcolor="rgba(20, 24, 31, 0.72)",
-            bordercolor="rgba(255, 255, 255, 0.18)",
-            borderwidth=1,
-            borderpad=6,
+            text=dashboard_summary,
+            xref="paper", yref="paper", x=0, y=1.045,
+            xanchor="left", yanchor="bottom", showarrow=False, align="left",
+            font=dict(size=12.5, color="#F5F5F5"),
+            bgcolor="rgba(20,24,31,0.78)",
+            bordercolor="rgba(255,255,255,0.22)",
+            borderwidth=1, borderpad=7,
         )
 
-    if current_state:
-        fig.add_annotation(
-            text=_format_current_state_annotation(current_state),
-            xref="paper",
-            yref="paper",
-            x=0,
-            y=1.09,
-            xanchor="left",
-            yanchor="bottom",
-            showarrow=False,
-            align="left",
-            font=dict(size=12, color="#F5F5F5"),
-            bgcolor="rgba(20, 24, 31, 0.78)",
-            bordercolor="rgba(255, 255, 255, 0.22)",
-            borderwidth=1,
-            borderpad=6,
-        )
-
+    # 주식만 주말 갭 제거 (암호화폐·24시간 자산은 주말 데이터 존재 → 적용 제외)
     has_weekend = any(d.weekday() >= 5 for d in df.index[:min(60, len(df))])
     if not has_weekend:
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
@@ -1052,37 +1368,34 @@ def plot_dashboard(df: pd.DataFrame,
 # ──────────────────────────────────────────────
 
 def backtest_golden_cross(df: pd.DataFrame,
-                          initial_capital: float = 10_000_000,
-                          commission: float = 0.00015,
-                          risk_free_rate: float = 0.03,
-                          annualization_days: int = 252) -> dict:
+                           initial_capital: float = DEFAULT_INITIAL_CAPITAL,
+                           commission: float = DEFAULT_COMMISSION,
+                           risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+                           annualization_days: int = 252) -> dict:
     """
     골든크로스(MA20 > MA60) 매수 / 데드크로스 매도 전략 백테스팅.
 
     Parameters
     ----------
     df                 : 기술적 지표가 추가된 DataFrame
-    initial_capital    : 초기 자본금 (원)
+    initial_capital    : 초기 자본금
     commission         : 수수료율 (기본 0.015%)
     risk_free_rate     : 무위험 수익률 (연, 소수점)
     annualization_days : 연환산 기준 거래일 수 (주식=252, 암호화폐=365)
 
-    Returns
-    -------
-    dict with trade log and performance metrics
+    Note: 기간 말 미청산 포지션은 마지막 날 종가로 강제 청산 처리됨.
+          이는 B&H 와의 공정한 비교를 위해 매도 수수료를 포함한다.
     """
-    # [FIX] iterrows → NumPy 배열 기반 반복 (약 10x 빠름)
     signals = df["MA_Signal"].values
     prices  = df["Close"].values
     dates   = df.index
 
     cash   = initial_capital
     shares = 0.0
-    trades = []
+    trades: list[dict] = []
     equity = np.empty(len(df))
 
     for i in range(len(df)):
-        # [FIX] row.get() deprecated → 배열 직접 참조
         signal = signals[i]
         price  = float(prices[i])
 
@@ -1091,7 +1404,7 @@ def backtest_golden_cross(df: pd.DataFrame,
             shares = (cash - fee) / price
             trades.append({
                 "date": dates[i], "type": "buy",
-                "price": price, "shares": shares, "fee": fee
+                "price": price, "shares": shares, "fee": fee,
             })
             cash = 0.0
 
@@ -1101,13 +1414,13 @@ def backtest_golden_cross(df: pd.DataFrame,
             cash        = sell_amount - fee
             trades.append({
                 "date": dates[i], "type": "sell",
-                "price": price, "shares": shares, "fee": fee
+                "price": price, "shares": shares, "fee": fee,
             })
             shares = 0.0
 
         equity[i] = cash + shares * price
 
-    # 기간 말 잔여 포지션 청산
+    # 기간 말 잔여 포지션 청산 (equity[-1] 은 실현가로 덮어씀)
     if shares > 0:
         last_price  = float(prices[-1])
         sell_amount = shares * last_price
@@ -1115,17 +1428,15 @@ def backtest_golden_cross(df: pd.DataFrame,
         cash        = sell_amount - fee
         trades.append({
             "date": dates[-1], "type": "sell(final)",
-            "price": last_price, "shares": shares, "fee": fee
+            "price": last_price, "shares": shares, "fee": fee,
         })
         equity[-1] = cash
 
     equity_series = pd.Series(equity, index=dates)
 
-    # 성과 지표
     final_equity = float(equity_series.iloc[-1])
     total_ret    = (final_equity - initial_capital) / initial_capital
 
-    # n_days = 실제 수익률 기간 수 (len - 1)
     n_days    = max(len(equity_series) - 1, 1)
     final_cum = final_equity / initial_capital if initial_capital > 0 else 1.0
     annual_ret = (final_cum ** (annualization_days / n_days)) - 1 if final_cum > 0 else 0.0
@@ -1133,23 +1444,18 @@ def backtest_golden_cross(df: pd.DataFrame,
     daily_ret_bt = equity_series.pct_change().dropna()
     annual_vol   = daily_ret_bt.std() * math.sqrt(annualization_days)
 
-    # [FIX] risk_free_rate 파라미터 사용 (기존 하드코딩 0.03 제거)
     if annual_vol > 1e-8:
         sharpe = (annual_ret - risk_free_rate) / annual_vol
     else:
         sharpe = 0.0
 
-    roll_max  = equity_series.cummax()
-    mdd       = ((equity_series - roll_max) / roll_max).min()
+    roll_max = equity_series.cummax()
+    mdd      = ((equity_series - roll_max) / roll_max).min()
 
-    # 승률: buy-sell 페어 매칭 (전략상 항상 교대 발생)
     buy_trades  = [t for t in trades if t["type"] == "buy"]
     sell_trades = [t for t in trades if "sell" in t["type"]]
-
-    wins = sum(
-        1 for b, s in zip(buy_trades, sell_trades)
-        if s["price"] > b["price"]
-    )
+    wins     = sum(1 for b, s in zip(buy_trades, sell_trades)
+                   if s["price"] > b["price"])
     n_trades = len(sell_trades)
     win_rate = wins / n_trades if n_trades > 0 else 0.0
 
@@ -1172,17 +1478,17 @@ def backtest_golden_cross(df: pd.DataFrame,
 
 
 def backtest_buy_and_hold(df: pd.DataFrame,
-                          initial_capital: float = 10_000_000,
-                          commission: float = 0.00015,
-                          risk_free_rate: float = 0.03,
-                          annualization_days: int = 252) -> dict:
+                           initial_capital: float = DEFAULT_INITIAL_CAPITAL,
+                           commission: float = DEFAULT_COMMISSION,
+                           risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+                           annualization_days: int = 252) -> dict:
     """
     Buy & Hold 전략 성과 계산.
 
-    Parameters
-    ----------
-    risk_free_rate     : 무위험 수익률 (연, 소수점)
-    annualization_days : 연환산 기준 거래일 수 (주식=252, 암호화폐=365)
+    [FIX 1차 B-4] MDD 기준 통일:
+      기존: 종가 수익률 cumprod (수수료 미반영, 첫날 제외)
+      수정: equity_series = shares * Close (수수료 반영 shares, 전 기간 커버)
+      → 골든크로스 전략과 동일 기준으로 MDD 비교 가능
     """
     buy_price = float(df["Close"].iloc[0])
     buy_fee   = initial_capital * commission
@@ -1195,7 +1501,6 @@ def backtest_buy_and_hold(df: pd.DataFrame,
 
     total_ret = (final_equity - initial_capital) / initial_capital
 
-    # n_days = 실제 수익률 기간 수 (len - 1)
     n_days    = max(len(df) - 1, 1)
     annual_ret = (1 + total_ret) ** (annualization_days / n_days) - 1 \
                  if (1 + total_ret) > 0 else 0.0
@@ -1203,15 +1508,15 @@ def backtest_buy_and_hold(df: pd.DataFrame,
     close_ret  = df["Close"].pct_change().dropna()
     annual_vol = close_ret.std() * math.sqrt(annualization_days)
 
-    # [FIX] risk_free_rate 파라미터 사용
     if annual_vol > 1e-8:
         sharpe = (annual_ret - risk_free_rate) / annual_vol
     else:
         sharpe = 0.0
 
-    cum      = (1 + close_ret).cumprod()
-    roll_max = cum.cummax()
-    mdd      = ((cum - roll_max) / roll_max).min()
+    # [FIX 1차 B-4] equity_series 기반 MDD (골든크로스 방식 통일)
+    equity_series = pd.Series(shares * df["Close"].values, index=df.index)
+    roll_max      = equity_series.cummax()
+    mdd           = ((equity_series - roll_max) / roll_max).min()
 
     return {
         "final_equity":    final_equity,
@@ -1224,7 +1529,7 @@ def backtest_buy_and_hold(df: pd.DataFrame,
     }
 
 
-def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str):
+def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str) -> None:
     """백테스팅 결과를 콘솔에 출력."""
     sep = "-" * 60
 
@@ -1242,7 +1547,7 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str):
     print(f"  샤프 비율         : {bt_result['sharpe']:>15.3f}")
     print(f"  최대 낙폭 (MDD)   : {bt_result['mdd']*100:>14.2f} %")
     print(f"  총 거래 횟수      : {bt_result['n_trades']:>15} 회")
-    print(f"  승률              : {bt_result['win_rate']*100:>14.1f} %")
+    print(f"  승률 (가격 기준)  : {bt_result['win_rate']*100:>14.1f} %")
 
     print(f"\n[ Buy & Hold 전략 ]")
     print(sep)
@@ -1267,7 +1572,7 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str):
               else "Buy & Hold 전략")
     print(f"\n  > 이 기간 우위 전략: {winner}")
 
-    # [FIX] 개별 거래 내역 (매수/매도 페어 + 손익)
+    # 개별 거래 내역 (매수/매도 페어 + 손익)
     trades      = bt_result.get("trades", [])
     buy_trades  = [t for t in trades if t["type"] == "buy"]
     sell_trades = [t for t in trades if "sell" in t["type"]]
@@ -1277,12 +1582,30 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str):
         print(f"  {'#':>3}  {'매수일':^12}  {'매수가':>10}  {'매도일':^12}  {'매도가':>10}  {'손익(%)':>10}  {'결과':^4}")
         print(sep)
         for idx, (b, s) in enumerate(zip(buy_trades, sell_trades), start=1):
-            buy_d  = b["date"].strftime("%Y-%m-%d") if hasattr(b["date"], "strftime") else str(b["date"])[:10]
-            sell_d = s["date"].strftime("%Y-%m-%d") if hasattr(s["date"], "strftime") else str(s["date"])[:10]
+            buy_d  = (b["date"].strftime("%Y-%m-%d")
+                      if hasattr(b["date"], "strftime") else str(b["date"])[:10])
+            sell_d = (s["date"].strftime("%Y-%m-%d")
+                      if hasattr(s["date"], "strftime") else str(s["date"])[:10])
             net_pnl_pct = (s["price"] - b["price"]) / b["price"] * 100
             result      = "WIN " if s["price"] > b["price"] else "LOSS"
-            print(f"  {idx:>3}  {buy_d:^12}  {b['price']:>10,.1f}  {sell_d:^12}  {s['price']:>10,.1f}  {net_pnl_pct:>+9.2f}%  {result:^4}")
+            print(f"  {idx:>3}  {buy_d:^12}  {b['price']:>10,.1f}  "
+                  f"{sell_d:^12}  {s['price']:>10,.1f}  {net_pnl_pct:>+9.2f}%  {result:^4}")
     print(f"{'='*60}\n")
+
+
+def summarize_strategy_comparison(bt_result: dict, bah_result: dict) -> dict:
+    """대시보드 표시용 백테스트 전략 비교 요약."""
+    return_diff = bt_result["total_return"] - bah_result["total_return"]
+    sharpe_diff = bt_result["sharpe"] - bah_result["sharpe"]
+    mdd_diff    = bt_result["mdd"] - bah_result["mdd"]
+    winner = ("골든크로스 전략" if bt_result["total_return"] > bah_result["total_return"]
+              else "Buy & Hold 전략")
+    return {
+        "winner": winner,
+        "return_diff": return_diff,
+        "sharpe_diff": sharpe_diff,
+        "mdd_diff": mdd_diff,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -1290,42 +1613,74 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str):
 # ──────────────────────────────────────────────
 
 def run_analysis(ticker: str,
-                 period_years: float = 1.0,
+                 period_years: float = DEFAULT_PERIOD_YEARS,
                  start: str = None,
                  end: str = None,
-                 initial_capital: float = 10_000_000,
-                 commission: float = 0.00015,
-                 risk_free_rate: float = 0.03,
+                 initial_capital: float = DEFAULT_INITIAL_CAPITAL,
+                 commission: float = DEFAULT_COMMISSION,
+                 risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
                  show_chart: bool = True,
                  overwrite_html: bool = False,
+                 output_dir: str | Path = ".",
                  benchmarks: tuple[str, ...] | None = None,
                  benchmark_preset: str = "auto",
                  show_excess_return: bool = True,
-                 benchmark_display: str = "all",
+                 benchmark_display: str = "cumulative",
                  corr_window: int = 60,
-                 show_marker_legend: bool = True) -> dict:
+                 show_marker_legend: bool = True,
+                 show_signal_markers: bool = True,
+                 show_benchmark_legend: bool = False) -> dict:
     """
     전체 분석 파이프라인 실행.
 
     Parameters
     ----------
-    ticker          : 종목 코드 (예: AAPL, 005930, BTC-USD)
-    period_years    : 분석 기간 (년, start/end 미지정 시 사용)
-    start / end     : 직접 날짜 지정 'YYYY-MM-DD' (None이면 period_years 사용)
-    initial_capital : 백테스팅 초기 자본금
-    commission      : 매수·매도 수수료율 (기본 0.015%)
-    risk_free_rate  : 무위험 수익률 (연, 소수점)
-    show_chart      : Plotly 대시보드 표시 여부
-    overwrite_html  : True → 기존 HTML 덮어쓰기 / False → 타임스탬프 파일명
+    ticker           : 종목 코드 (예: AAPL, 005930, BTC-USD)
+    period_years     : 분석 기간 (년, start/end 미지정 시 사용)
+    start / end      : 직접 날짜 지정 'YYYY-MM-DD' (None 이면 period_years 사용)
+    initial_capital  : 백테스팅 초기 자본금
+    commission       : 매수·매도 수수료율 (기본 0.015%)
+    risk_free_rate   : 무위험 수익률 (연, 소수점)
+    show_chart       : Plotly 대시보드 표시 여부
+    overwrite_html   : True → 기존 HTML 덮어쓰기 / False → 타임스탬프 파일명
+    output_dir       : HTML 저장 디렉터리 (기본: 현재 디렉터리)
+    benchmarks       : 명시적 벤치마크 튜플 (None 이면 preset 사용)
+    benchmark_preset : 'auto'·'us'·'korea'·'crypto'·'off'
+    show_excess_return: 초과수익선 표시 여부
+    benchmark_display : 'all'·'cumulative'·'excess'
+    corr_window      : 롤링 상관계수 창 (거래일)
+    show_marker_legend: 시그널 마커 범례 표시 여부
+    show_signal_markers: 시그널 마커 표시 여부
+    show_benchmark_legend: 벤치마크 라인 범례 표시 여부
 
     Returns
     -------
-    dict { df, stats, bt_result, bah_result, annualization_days }
+    dict {
+        'df'                   : 지표가 추가된 DataFrame,
+        'stats'                : compute_returns 결과 dict,
+        'bt_result'            : 골든크로스 백테스팅 결과 dict,
+        'bah_result'           : Buy & Hold 결과 dict,
+        'annualization_days'   : 사용된 연환산 기준일,
+        'current_state'        : 현재 기술적 상태 요약 dict,
+        'benchmark_comparison' : 벤치마크 비교 결과 list[dict],
+        'strategy_summary'     : 백테스트 전략 비교 요약 dict,
+        'data_quality'         : 데이터 품질 검사 결과 dict,
+        'external_price_check' : 외부 기준 가격 비교 결과 dict,
+    }
     """
-    # 0. 파라미터 검증 & 의존성 확인
+    # 0-a. 파라미터 검증
     _validate_params(ticker, initial_capital, commission, period_years)
+
+    # 0-b. ticker 정규화 — 이하 모든 함수에 정규화된 ticker 전달
+    # [FIX 1차 H-4] fetch_data 내부에서만 처리하던 것을 파이프라인 진입부로 이동
+    ticker = ticker.strip()
+    if not is_korean_ticker(ticker):
+        ticker = ticker.upper()
+
+    # 0-c. 의존성 확인 (정규화된 ticker 기준)
+    # [FIX 1차 B-2] 원본 ticker 로 is_korean_ticker 호출하던 문제 해결
     _check_deps(need_plotly=show_chart,
-                need_fdr=ticker.isdigit() and len(ticker) == 6)
+                need_fdr=is_korean_ticker(ticker))
 
     print(f"\n{'='*55}")
     print(f"  주식 분석 시스템 시작 | 티커: {ticker}")
@@ -1333,7 +1688,7 @@ def run_analysis(ticker: str,
 
     # 1. 데이터 수집
     df = fetch_data(ticker, period_years=period_years, start=start, end=end)
-    data_quality = print_data_quality_check(ticker, df)
+    data_quality         = print_data_quality_check(ticker, df)
     external_price_check = print_external_price_check(ticker, df)
 
     # 2. 자산 유형별 연환산 기준 자동 결정
@@ -1342,9 +1697,8 @@ def run_analysis(ticker: str,
           f"({'암호화폐·24/7' if ann_days == 365 else '주식·평일 거래'})")
 
     # 3. 수익률/리스크 지표
-    stats = compute_returns(df,
-                            risk_free_rate=risk_free_rate,
-                            annualization_days=ann_days)
+    stats = compute_returns(df, risk_free_rate=risk_free_rate,
+                             annualization_days=ann_days)
 
     # 4. 기술적 지표
     df = add_indicators(df)
@@ -1354,9 +1708,10 @@ def run_analysis(ticker: str,
     current_state = summarize_current_state(df)
     print_current_state(current_state, ticker)
 
+    # 6. 벤치마크 비교 (병렬 fetch)
     selected_benchmarks = _select_benchmarks(ticker, benchmarks, benchmark_preset)
     benchmark_start = df.index[0].strftime("%Y-%m-%d")
-    benchmark_end = (df.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
+    benchmark_end   = (df.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
     benchmark_comparison = compute_benchmark_comparison(
         stats,
         start=benchmark_start,
@@ -1368,38 +1723,52 @@ def run_analysis(ticker: str,
     )
     print_benchmark_report(ticker, stats, benchmark_comparison)
 
-    # 6. 시각화
+    # 7. 백테스팅
+    bt_result  = backtest_golden_cross(df,
+                                        initial_capital=initial_capital,
+                                        commission=commission,
+                                        risk_free_rate=risk_free_rate,
+                                        annualization_days=ann_days)
+    bah_result = backtest_buy_and_hold(df,
+                                        initial_capital=initial_capital,
+                                        commission=commission,
+                                        risk_free_rate=risk_free_rate,
+                                        annualization_days=ann_days)
+    strategy_summary = summarize_strategy_comparison(bt_result, bah_result)
+
+    # 8. 시각화
     if show_chart:
-        fig      = plot_dashboard(df, ticker, stats, current_state=current_state,
-                                  benchmark_comparison=benchmark_comparison,
-                                  show_excess_return=show_excess_return,
-                                  benchmark_display=benchmark_display,
-                                  show_marker_legend=show_marker_legend)
-        out_path = _make_html_path(ticker, overwrite=overwrite_html)
+        fig      = plot_dashboard(df, ticker, stats,
+                                   current_state=current_state,
+                                   benchmark_comparison=benchmark_comparison,
+                                   show_excess_return=show_excess_return,
+                                   benchmark_display=benchmark_display,
+                                   show_marker_legend=show_marker_legend,
+                                   show_signal_markers=show_signal_markers,
+                                   strategy_summary=strategy_summary,
+                                   data_quality=data_quality,
+                                   show_benchmark_legend=show_benchmark_legend)
+        out_path = _make_html_path(ticker,
+                                   overwrite=overwrite_html,
+                                   output_dir=output_dir)
         fig.write_html(out_path)
         print(f"[차트 저장] {out_path}")
         fig.show()
 
-    # 7. 백테스팅
-    bt_result  = backtest_golden_cross(df,
-                                       initial_capital=initial_capital,
-                                       commission=commission,
-                                       risk_free_rate=risk_free_rate,
-                                       annualization_days=ann_days)
-    bah_result = backtest_buy_and_hold(df,
-                                       initial_capital=initial_capital,
-                                       commission=commission,
-                                       risk_free_rate=risk_free_rate,
-                                       annualization_days=ann_days)
     print_backtest_report(bt_result, bah_result, ticker)
 
-    return {"df": df, "stats": stats,
-            "bt_result": bt_result, "bah_result": bah_result,
-            "annualization_days": ann_days,
-            "current_state": current_state,
-            "benchmark_comparison": benchmark_comparison,
-            "data_quality": data_quality,
-            "external_price_check": external_price_check}
+    return {
+        "df":                   df,
+        "stats":                stats,
+        "bt_result":            bt_result,
+        "bah_result":           bah_result,
+        "annualization_days":   ann_days,
+        "current_state":        current_state,
+        "benchmark_comparison": benchmark_comparison,
+        "strategy_summary":     strategy_summary,
+        "data_quality":         data_quality,
+        "external_price_check": external_price_check,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -1410,26 +1779,18 @@ def main() -> None:
     """
     CLI 진입점.
 
-    파일 상단 설정값 변경 방식과 CLI 인자 방식 모두 지원.
-    CLI 인자가 있으면 CLI 우선, 없으면 아래 기본값 사용.
+    [FIX 1차 H-3] DEFAULT_* 상수를 함수 내 재정의 → 모듈 레벨 상수 참조
 
     사용 예시
     ---------
-    python stock_analysis.py                          # 기본값(AAPL, 2년)
+    python stock_analysis.py                              # 기본값(AAPL, 2년)
     python stock_analysis.py TSLA --years 3
     python stock_analysis.py 005930 --capital 5000000
     python stock_analysis.py BTC-USD --years 1 --no-chart
     python stock_analysis.py AAPL --start 2022-01-01 --end 2024-01-01
-    python stock_analysis.py AAPL --overwrite        # HTML 덮어쓰기
+    python stock_analysis.py AAPL --overwrite
+    python stock_analysis.py AAPL --output-dir ./reports
     """
-    # ── 코드 내 기본값 (CLI 인자 없을 때 사용) ──────────────
-    DEFAULT_TICKER          = "AAPL"
-    DEFAULT_PERIOD_YEARS    = 2.0
-    DEFAULT_INITIAL_CAPITAL = 10_000_000
-    DEFAULT_COMMISSION      = 0.00015
-    DEFAULT_RISK_FREE_RATE  = 0.03
-    # ────────────────────────────────────────────────────────
-
     parser = argparse.ArgumentParser(
         prog="stock_analysis",
         description="주식·암호화폐 기술적 분석 및 골든크로스 백테스팅",
@@ -1437,75 +1798,102 @@ def main() -> None:
     )
     parser.add_argument(
         "ticker", nargs="?", default=DEFAULT_TICKER,
-        help=f"종목 코드 (기본값: {DEFAULT_TICKER})\n예: AAPL  005930  BTC-USD  TSLA"
+        help=f"종목 코드 (기본값: {DEFAULT_TICKER})\n예: AAPL  005930  BTC-USD  TSLA",
     )
     parser.add_argument(
-        "--years", type=float, default=DEFAULT_PERIOD_YEARS,
-        metavar="N",
-        help=f"분석 기간 (년, 기본값: {DEFAULT_PERIOD_YEARS})"
+        "--years", type=float, default=DEFAULT_PERIOD_YEARS, metavar="N",
+        help=f"분석 기간 (년, 기본값: {DEFAULT_PERIOD_YEARS})",
     )
     parser.add_argument(
         "--start", type=str, default=None, metavar="YYYY-MM-DD",
-        help="시작일 (지정 시 --years 무시)"
+        help="시작일 (지정 시 --years 무시)",
     )
     parser.add_argument(
         "--end", type=str, default=None, metavar="YYYY-MM-DD",
-        help="종료일 (지정 시 --years 무시)"
+        help="종료일 (지정 시 --years 무시. 미지정 시 오늘)",
     )
     parser.add_argument(
-        "--capital", type=float, default=DEFAULT_INITIAL_CAPITAL,
-        metavar="N",
-        help=f"초기 자본금 (기본값: {DEFAULT_INITIAL_CAPITAL:,})"
+        "--capital", type=float, default=DEFAULT_INITIAL_CAPITAL, metavar="N",
+        help=f"초기 자본금 (기본값: {DEFAULT_INITIAL_CAPITAL:,})",
     )
     parser.add_argument(
-        "--commission", type=float, default=DEFAULT_COMMISSION,
-        metavar="F",
-        help=f"수수료율 0~1 (기본값: {DEFAULT_COMMISSION})"
+        "--commission", type=float, default=DEFAULT_COMMISSION, metavar="F",
+        help=f"수수료율 0~1 (기본값: {DEFAULT_COMMISSION})",
     )
     parser.add_argument(
-        "--rfr", type=float, default=DEFAULT_RISK_FREE_RATE,
-        metavar="F",
-        help=f"무위험 수익률 (기본값: {DEFAULT_RISK_FREE_RATE})"
+        "--rfr", type=float, default=DEFAULT_RISK_FREE_RATE, metavar="F",
+        help=f"무위험 수익률 (기본값: {DEFAULT_RISK_FREE_RATE})",
     )
     parser.add_argument(
         "--no-chart", action="store_true",
-        help="차트 표시 및 HTML 저장 생략"
+        help="차트 표시 및 HTML 저장 생략",
     )
     parser.add_argument(
         "--overwrite", action="store_true",
-        help="기존 HTML 대시보드 덮어쓰기 (기본: 타임스탬프 파일명)"
+        help="기존 HTML 대시보드 덮어쓰기 (기본: 타임스탬프 파일명)",
     )
-
+    # [FIX 2차 B-2] --output-dir 파라미터 추가
     parser.add_argument(
-        "--benchmarks", type=_parse_benchmarks, default=None,
-        metavar="A,B",
-        help="benchmark tickers separated by commas (default: auto by asset type)"
+        "--output-dir", type=str, default=".", metavar="DIR",
+        help="HTML 대시보드 저장 디렉터리 (기본값: 현재 디렉터리)",
     )
     parser.add_argument(
-        "--benchmark-preset", choices=("auto", "us", "korea", "crypto", "off"),
+        "--benchmarks", type=_parse_benchmarks, default=None, metavar="A,B",
+        help="쉼표 구분 벤치마크 티커 (기본: 자산 유형 자동 선택)",
+    )
+    parser.add_argument(
+        "--benchmark-preset",
+        choices=("auto", "us", "korea", "crypto", "off"),
         default="auto",
-        help="benchmark preset to use when --benchmarks is not provided"
+        help="벤치마크 프리셋 (--benchmarks 미지정 시 사용)",
+    )
+    parser.add_argument(
+        "--chart-mode",
+        choices=("clean", "full"),
+        default="clean",
+        help="차트 표시 모드: clean(기본, 단순 표시) / full(마커·초과수익·범례 표시)",
     )
     parser.add_argument(
         "--no-excess-line", action="store_true",
-        help="hide benchmark excess-return lines in the dashboard"
+        help="대시보드에서 초과수익선 숨김",
     )
     parser.add_argument(
-        "--benchmark-display", choices=("all", "cumulative", "excess"),
-        default="all",
-        help="benchmark panel line mode: all, cumulative, or excess"
+        "--benchmark-display",
+        choices=("all", "cumulative", "excess"),
+        default=None,
+        help="벤치마크 패널 표시 모드: all / cumulative / excess",
     )
     parser.add_argument(
-        "--corr-window", type=_positive_int, default=60,
-        metavar="N",
-        help="rolling correlation window in trading days (default: 60)"
+        "--corr-window", type=_positive_int, default=60, metavar="N",
+        help="롤링 상관계수 창 (거래일, 기본값: 60)",
     )
     parser.add_argument(
         "--hide-marker-legend", action="store_true",
-        help="hide auxiliary signal marker entries from the dashboard legend"
+        help="대시보드 범례에서 시그널 마커 항목 숨김",
+    )
+    parser.add_argument(
+        "--hide-signal-markers", action="store_true",
+        help="대시보드에서 RSI/MACD/크로스 보조 시그널 마커 숨김",
+    )
+    parser.add_argument(
+        "--show-signal-markers", action="store_true",
+        help="clean 모드에서도 RSI/MACD/크로스 보조 시그널 마커 표시",
     )
 
     args = parser.parse_args()
+    benchmark_display = args.benchmark_display
+    if benchmark_display is None:
+        benchmark_display = "all" if args.chart_mode == "full" else "cumulative"
+
+    if args.hide_signal_markers:
+        show_signal_markers = False
+    elif args.show_signal_markers:
+        show_signal_markers = True
+    else:
+        show_signal_markers = args.chart_mode == "full"
+
+    show_marker_legend    = args.chart_mode == "full" and not args.hide_marker_legend
+    show_benchmark_legend = args.chart_mode == "full"
 
     try:
         run_analysis(
@@ -1518,12 +1906,15 @@ def main() -> None:
             risk_free_rate=args.rfr,
             show_chart=not args.no_chart,
             overwrite_html=args.overwrite,
+            output_dir=args.output_dir,
             benchmarks=args.benchmarks,
             benchmark_preset=args.benchmark_preset,
             show_excess_return=not args.no_excess_line,
-            benchmark_display=args.benchmark_display,
+            benchmark_display=benchmark_display,
             corr_window=args.corr_window,
-            show_marker_legend=not args.hide_marker_legend,
+            show_marker_legend=show_marker_legend,
+            show_signal_markers=show_signal_markers,
+            show_benchmark_legend=show_benchmark_legend,
         )
     except (ValueError, ImportError) as e:
         print(f"\n[오류] {e}")

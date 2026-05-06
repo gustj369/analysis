@@ -112,6 +112,10 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertEqual(kwargs["ticker"], "BTC-USD")
         self.assertEqual(kwargs["period_years"], 1.0)
         self.assertFalse(kwargs["show_chart"])
+        self.assertEqual(kwargs["benchmark_display"], "cumulative")
+        self.assertFalse(kwargs["show_marker_legend"])
+        self.assertFalse(kwargs["show_signal_markers"])
+        self.assertFalse(kwargs["show_benchmark_legend"])
 
     def test_main_passes_explicit_cli_options(self):
         argv = [
@@ -130,6 +134,8 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "--overwrite",
             "--benchmarks",
             "VTI,QQQ",
+            "--chart-mode",
+            "full",
             "--benchmark-preset",
             "crypto",
             "--no-excess-line",
@@ -138,6 +144,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "--corr-window",
             "30",
             "--hide-marker-legend",
+            "--hide-signal-markers",
         ]
 
         with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
@@ -158,6 +165,8 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertEqual(kwargs["benchmark_display"], "excess")
         self.assertEqual(kwargs["corr_window"], 30)
         self.assertFalse(kwargs["show_marker_legend"])
+        self.assertFalse(kwargs["show_signal_markers"])
+        self.assertTrue(kwargs["show_benchmark_legend"])
 
     def test_run_analysis_includes_current_state_summary(self):
         df = self._sample_price_frame()
@@ -173,6 +182,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
 
         self.assertIn("current_state", result)
         self.assertIn("benchmark_comparison", result)
+        self.assertIn("strategy_summary", result)
         self.assertIn("data_quality", result)
         self.assertIn("external_price_check", result)
         self.assertEqual(result["current_state"]["trend"], "상승 우위")
@@ -419,6 +429,16 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "corr_window": 60,
             "error": None,
         }]
+        strategy_summary = {
+            "winner": "Buy & Hold 전략",
+            "return_diff": -0.10,
+            "sharpe_diff": -0.25,
+            "mdd_diff": 0.02,
+        }
+        data_quality = {
+            "checked": True,
+            "warnings": ["wide_close_range"],
+        }
 
         fig = sa.plot_dashboard(
             df,
@@ -426,11 +446,13 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             stats,
             current_state=current_state,
             benchmark_comparison=benchmark_comparison,
+            strategy_summary=strategy_summary,
+            data_quality=data_quality,
         )
 
         self.assertEqual(fig.layout.height, 1120)
-        self.assertEqual(fig.layout.margin.t, 145)
-        self.assertGreaterEqual(len(fig.data), 11)
+        self.assertEqual(fig.layout.margin.t, 120)
+        self.assertGreaterEqual(len(fig.data), 10)
         self.assertTrue(fig.layout.annotations)
         self.assertGreaterEqual(len(fig.layout.annotations), 2)
         self.assertIn("현재 상태", fig.layout.annotations[-1].text)
@@ -438,16 +460,33 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
 
         annotation_text = " ".join(annotation.text or "" for annotation in fig.layout.annotations)
         self.assertIn("60D", annotation_text)
+        self.assertIn("성과", annotation_text)
+        self.assertIn("전략", annotation_text)
+        self.assertIn("데이터 주의", annotation_text)
+        self.assertIn("wide_close_range", annotation_text)
+        self.assertIn("#FFB74D", annotation_text)
 
-        fig_without_excess = sa.plot_dashboard(
+        benchmark_trace_names = {"TEST 누적수익률", "SPY 누적수익률", "TEST vs SPY 초과수익"}
+        benchmark_traces = [trace for trace in fig.data if trace.name in benchmark_trace_names]
+        self.assertTrue(benchmark_traces)
+        self.assertTrue(all(trace.showlegend is False for trace in benchmark_traces))
+        self.assertTrue(all(trace.legendgroup == "benchmark" for trace in benchmark_traces))
+        self.assertIn("price", {trace.legendgroup for trace in fig.data if trace.name == "캔들"})
+        self.assertIn("indicator", {trace.legendgroup for trace in fig.data if trace.name == "RSI"})
+
+        fig_all_lines = sa.plot_dashboard(
             df,
             "TEST",
             stats,
             current_state=current_state,
             benchmark_comparison=benchmark_comparison,
-            show_excess_return=False,
+            benchmark_display="all",
+            strategy_summary=strategy_summary,
+            show_benchmark_legend=True,
         )
-        self.assertEqual(len(fig_without_excess.data), len(fig.data) - 1)
+        self.assertEqual(len(fig_all_lines.data), len(fig.data) + 1)
+        benchmark_traces = [trace for trace in fig_all_lines.data if trace.name in benchmark_trace_names]
+        self.assertTrue(any(trace.showlegend is True for trace in benchmark_traces))
 
         fig_excess_only = sa.plot_dashboard(
             df,
@@ -456,6 +495,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             current_state=current_state,
             benchmark_comparison=benchmark_comparison,
             benchmark_display="excess",
+            strategy_summary=strategy_summary,
         )
         self.assertLess(len(fig_excess_only.data), len(fig.data))
 
@@ -466,11 +506,24 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             current_state=current_state,
             benchmark_comparison=benchmark_comparison,
             show_marker_legend=False,
+            strategy_summary=strategy_summary,
         )
         marker_names = {"골든크로스", "데드크로스", "RSI 매수", "RSI 매도", "MACD 골든", "MACD 데드"}
         marker_traces = [trace for trace in fig_without_marker_legend.data if trace.name in marker_names]
         self.assertTrue(marker_traces)
         self.assertTrue(all(trace.showlegend is False for trace in marker_traces))
+
+        fig_without_signal_markers = sa.plot_dashboard(
+            df,
+            "TEST",
+            stats,
+            current_state=current_state,
+            benchmark_comparison=benchmark_comparison,
+            show_signal_markers=False,
+            strategy_summary=strategy_summary,
+        )
+        marker_traces = [trace for trace in fig_without_signal_markers.data if trace.name in marker_names]
+        self.assertEqual(marker_traces, [])
 
     @unittest.skipUnless(
         os.getenv("RUN_NETWORK_TESTS") == "1",
