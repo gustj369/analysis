@@ -12,7 +12,6 @@ import sys
 import math
 import argparse
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -348,9 +347,7 @@ def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
         if raw.empty:
             raise ValueError(f"yfinance: '{ticker}' 데이터 없음")
 
-        # MultiIndex 평탄화 후 중복 컬럼 제거
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
+        raw = _flatten_yfinance_columns(raw, ticker)
         raw = raw.loc[:, ~raw.columns.duplicated(keep="first")]
 
         return raw
@@ -358,6 +355,26 @@ def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
         raise
     except Exception as e:
         raise ValueError(f"글로벌 주식 데이터 수집 실패 ({ticker}): {e}")
+
+
+def _flatten_yfinance_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """yfinance 단일 티커 MultiIndex 컬럼에서 OHLCV 레벨을 선택한다."""
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+
+    ohlcv_names = {"open", "high", "low", "close", "adj close", "volume"}
+    for level in range(df.columns.nlevels):
+        values = {str(value).lower().strip() for value in df.columns.get_level_values(level)}
+        if len(values & ohlcv_names) >= 4:
+            flattened = df.copy()
+            flattened.columns = flattened.columns.get_level_values(level)
+            return flattened
+
+    # 예상과 다른 MultiIndex 구조면 기존 동작에 가깝게 첫 레벨을 사용한다.
+    flattened = df.copy()
+    flattened.columns = flattened.columns.get_level_values(0)
+    print(f"[경고] yfinance MultiIndex 컬럼 구조 확인 필요 ({ticker}): {list(df.columns)[:6]}")
+    return flattened
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -644,7 +661,8 @@ def _fetch_one_benchmark(benchmark: str,
                          corr_window: int,
                          target_cum: pd.Series,
                          target_daily: pd.Series,
-                         target_total_return: float) -> dict:
+                         target_total_return: float,
+                         debug: bool = False) -> dict:
     """
     단일 벤치마크 데이터 수집 + 통계 계산 (ThreadPoolExecutor 내 실행용).
 
@@ -652,6 +670,13 @@ def _fetch_one_benchmark(benchmark: str,
     """
     try:
         bm_df    = fetch_data(benchmark, start=start, end=end)
+        first_close = float(bm_df["Close"].iloc[0])
+        last_close  = float(bm_df["Close"].iloc[-1])
+        if debug:
+            print(f"[벤치마크 검증] {benchmark} | "
+                  f"{bm_df.index[0].date()} {first_close:,.2f} → "
+                  f"{bm_df.index[-1].date()} {last_close:,.2f} | {len(bm_df)}행")
+
         bm_stats = compute_returns(bm_df,
                                    risk_free_rate=risk_free_rate,
                                    annualization_days=annualization_days)
@@ -661,6 +686,7 @@ def _fetch_one_benchmark(benchmark: str,
             [target_cum.rename("target"),
              bm_stats["cumulative_return"].rename("benchmark")],
             axis=1,
+            sort=False,
         ).ffill().dropna()
         excess_return_series = aligned_cum["target"] - aligned_cum["benchmark"]
 
@@ -668,6 +694,7 @@ def _fetch_one_benchmark(benchmark: str,
             [target_daily.rename("target"),
              bm_stats["daily_return"].rename("benchmark")],
             axis=1,
+            sort=False,
         ).dropna()
         rolling_corr = aligned_daily["target"].rolling(corr_window).corr(
             aligned_daily["benchmark"]
@@ -687,6 +714,9 @@ def _fetch_one_benchmark(benchmark: str,
             "rolling_corr":         rolling_corr,
             "corr_window":          corr_window,
             "latest_corr":          latest_corr,
+            "first_close":          first_close,
+            "last_close":           last_close,
+            "n_rows":               len(bm_df),
             "error":                None,
         }
     except Exception as exc:
@@ -701,6 +731,9 @@ def _fetch_one_benchmark(benchmark: str,
             "rolling_corr":         None,
             "corr_window":          corr_window,
             "latest_corr":          None,
+            "first_close":          None,
+            "last_close":           None,
+            "n_rows":               None,
             "error":                str(exc),
         }
 
@@ -711,13 +744,14 @@ def compute_benchmark_comparison(target_stats: dict,
                                   risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
                                   annualization_days: int = 252,
                                   benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS,
-                                  corr_window: int = 60) -> list[dict]:
+                                  corr_window: int = 60,
+                                  debug: bool = False) -> list[dict]:
     """
     대상 종목 수익률 지표를 시장 벤치마크와 비교한다.
 
     벤치마크 수집 실패는 error 필드로 기록하며 전체 분석을 중단하지 않는다.
 
-    [FIX 2차 C-2] 벤치마크 순차 fetch → ThreadPoolExecutor 병렬 수집
+    벤치마크는 yfinance 동시 호출 중복 가능성을 피하기 위해 순차 수집한다.
     """
     if not benchmarks:
         return []
@@ -736,22 +770,23 @@ def compute_benchmark_comparison(target_stats: dict,
         target_cum=target_cum,
         target_daily=target_daily,
         target_total_return=target_total_return,
+        debug=debug,
     )
 
-    # 병렬 fetch (I/O bound 작업; GIL 영향 없음)
-    results: dict[str, dict] = {}
-    max_workers = min(len(benchmarks), 4)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_fetch_one_benchmark, bm, **kwargs): bm
-            for bm in benchmarks
-        }
-        for future in as_completed(futures):
-            bm             = futures[future]
-            results[bm]    = future.result()
+    rows = [_fetch_one_benchmark(bm, **kwargs) for bm in benchmarks]
+    if debug:
+        seen: dict[tuple, str] = {}
+        for row in rows:
+            if row.get("error"):
+                continue
+            signature = (row.get("n_rows"), row.get("first_close"), row.get("last_close"))
+            if signature in seen:
+                print(f"[벤치마크 경고] {seen[signature]}와 {row['ticker']}의 "
+                      "행 수/첫 종가/마지막 종가가 같습니다. 원천 데이터를 확인하세요.")
+            else:
+                seen[signature] = row["ticker"]
 
-    # 입력 순서 유지
-    return [results[bm] for bm in benchmarks]
+    return rows
 
 
 def print_benchmark_report(ticker: str,
@@ -1629,7 +1664,8 @@ def run_analysis(ticker: str,
                  corr_window: int = 60,
                  show_marker_legend: bool = True,
                  show_signal_markers: bool = True,
-                 show_benchmark_legend: bool = False) -> dict:
+                 show_benchmark_legend: bool = False,
+                 debug_benchmarks: bool = False) -> dict:
     """
     전체 분석 파이프라인 실행.
 
@@ -1652,6 +1688,7 @@ def run_analysis(ticker: str,
     show_marker_legend: 시그널 마커 범례 표시 여부
     show_signal_markers: 시그널 마커 표시 여부
     show_benchmark_legend: 벤치마크 라인 범례 표시 여부
+    debug_benchmarks : 벤치마크 첫/마지막 종가 검증 로그 표시 여부
 
     Returns
     -------
@@ -1720,6 +1757,7 @@ def run_analysis(ticker: str,
         annualization_days=ann_days,
         benchmarks=selected_benchmarks,
         corr_window=corr_window,
+        debug=debug_benchmarks,
     )
     print_benchmark_report(ticker, stats, benchmark_comparison)
 
@@ -1879,6 +1917,14 @@ def main() -> None:
         "--show-signal-markers", action="store_true",
         help="clean 모드에서도 RSI/MACD/크로스 보조 시그널 마커 표시",
     )
+    parser.add_argument(
+        "--show-benchmark-legend", action="store_true",
+        help="대시보드 범례에 벤치마크 누적/초과수익 라인 항목 표시",
+    )
+    parser.add_argument(
+        "--debug-benchmarks", action="store_true",
+        help="벤치마크별 첫/마지막 종가와 행 수를 출력해 중복 데이터 여부 확인",
+    )
 
     args = parser.parse_args()
     benchmark_display = args.benchmark_display
@@ -1893,7 +1939,7 @@ def main() -> None:
         show_signal_markers = args.chart_mode == "full"
 
     show_marker_legend    = args.chart_mode == "full" and not args.hide_marker_legend
-    show_benchmark_legend = args.chart_mode == "full"
+    show_benchmark_legend = args.show_benchmark_legend
 
     try:
         run_analysis(
@@ -1915,6 +1961,7 @@ def main() -> None:
             show_marker_legend=show_marker_legend,
             show_signal_markers=show_signal_markers,
             show_benchmark_legend=show_benchmark_legend,
+            debug_benchmarks=args.debug_benchmarks,
         )
     except (ValueError, ImportError) as e:
         print(f"\n[오류] {e}")

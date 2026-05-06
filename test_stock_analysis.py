@@ -145,6 +145,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "30",
             "--hide-marker-legend",
             "--hide-signal-markers",
+            "--show-benchmark-legend",
         ]
 
         with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
@@ -167,6 +168,18 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertFalse(kwargs["show_marker_legend"])
         self.assertFalse(kwargs["show_signal_markers"])
         self.assertTrue(kwargs["show_benchmark_legend"])
+
+    def test_full_chart_mode_keeps_benchmark_legend_hidden_by_default(self):
+        argv = ["stock_analysis.py", "AAPL", "--chart-mode", "full", "--no-chart"]
+
+        with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
+            sa.main()
+
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["benchmark_display"], "all")
+        self.assertTrue(kwargs["show_marker_legend"])
+        self.assertTrue(kwargs["show_signal_markers"])
+        self.assertFalse(kwargs["show_benchmark_legend"])
 
     def test_run_analysis_includes_current_state_summary(self):
         df = self._sample_price_frame()
@@ -194,7 +207,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         benchmark_df = self._sample_price_frame(close=np.array([100.0, 110.0]))
         target_stats = sa.compute_returns(target_df, risk_free_rate=0.0, annualization_days=252)
 
-        with patch.object(sa, "fetch_data", return_value=benchmark_df):
+        with patch.object(sa, "fetch_data", return_value=benchmark_df), redirect_stdout(StringIO()):
             rows = sa.compute_benchmark_comparison(
                 target_stats,
                 start="2024-01-01",
@@ -203,6 +216,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
                 annualization_days=252,
                 benchmarks=("SPY",),
                 corr_window=2,
+                debug=True,
             )
 
         self.assertEqual(len(rows), 1)
@@ -215,6 +229,67 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertIn("rolling_corr", rows[0])
         self.assertIn("latest_corr", rows[0])
         self.assertEqual(rows[0]["corr_window"], 2)
+        self.assertEqual(rows[0]["first_close"], 100.0)
+        self.assertEqual(rows[0]["last_close"], 110.0)
+        self.assertEqual(rows[0]["n_rows"], 2)
+
+    def test_compute_benchmark_comparison_keeps_distinct_benchmark_results(self):
+        target_df = self._sample_price_frame(close=np.array([100.0, 130.0]))
+        spy_df = self._sample_price_frame(close=np.array([100.0, 110.0]))
+        qqq_df = self._sample_price_frame(close=np.array([100.0, 120.0]))
+        target_stats = sa.compute_returns(target_df, risk_free_rate=0.0, annualization_days=252)
+
+        def fake_fetch(ticker, start, end):
+            return {"SPY": spy_df, "QQQ": qqq_df}[ticker]
+
+        with patch.object(sa, "fetch_data", side_effect=fake_fetch) as fetch_mock:
+            rows = sa.compute_benchmark_comparison(
+                target_stats,
+                start="2024-01-01",
+                end="2024-01-03",
+                risk_free_rate=0.0,
+                annualization_days=252,
+                benchmarks=("SPY", "QQQ"),
+                corr_window=2,
+            )
+
+        self.assertEqual([call.args[0] for call in fetch_mock.call_args_list], ["SPY", "QQQ"])
+        self.assertEqual([row["ticker"] for row in rows], ["SPY", "QQQ"])
+        self.assertNotEqual(rows[0]["total_return"], rows[1]["total_return"])
+        self.assertAlmostEqual(rows[0]["total_return"], 0.10)
+        self.assertAlmostEqual(rows[1]["total_return"], 0.20)
+
+    def test_compute_benchmark_comparison_debug_warns_on_duplicate_price_signature(self):
+        target_df = self._sample_price_frame(close=np.array([100.0, 130.0]))
+        benchmark_df = self._sample_price_frame(close=np.array([100.0, 110.0]))
+        target_stats = sa.compute_returns(target_df, risk_free_rate=0.0, annualization_days=252)
+
+        stdout = StringIO()
+        with patch.object(sa, "fetch_data", return_value=benchmark_df), redirect_stdout(stdout):
+            rows = sa.compute_benchmark_comparison(
+                target_stats,
+                start="2024-01-01",
+                end="2024-01-03",
+                benchmarks=("SPY", "QQQ"),
+                debug=True,
+            )
+
+        self.assertEqual([row["ticker"] for row in rows], ["SPY", "QQQ"])
+        self.assertIn("벤치마크 검증", stdout.getvalue())
+        self.assertIn("벤치마크 경고", stdout.getvalue())
+
+    def test_flatten_yfinance_columns_selects_ohlcv_level(self):
+        columns = pd.MultiIndex.from_product(
+            [["AAPL"], ["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+        )
+        df = pd.DataFrame([[1, 2, 3, 4, 5, 6]], columns=columns)
+
+        flattened = sa._flatten_yfinance_columns(df, "AAPL")
+
+        self.assertEqual(
+            list(flattened.columns),
+            ["Open", "High", "Low", "Close", "Adj Close", "Volume"],
+        )
 
     def test_compute_benchmark_comparison_keeps_fetch_errors(self):
         target_df = self._sample_price_frame(close=np.array([100.0, 120.0]))

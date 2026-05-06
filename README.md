@@ -163,6 +163,20 @@ python stock_analysis.py AAPL --years 1 --hide-signal-markers
 python stock_analysis.py AAPL --years 1 --show-signal-markers
 ```
 
+Show benchmark lines in the legend:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --chart-mode full --show-benchmark-legend
+```
+
+Debug benchmark source data:
+
+```powershell
+python stock_analysis.py AAPL --years 1 --no-chart --debug-benchmarks
+```
+
+Use this when benchmark rows look suspiciously identical. It prints each benchmark's first close, last close, and row count.
+
 Choose the benchmark panel line mode or rolling-correlation window:
 
 ```powershell
