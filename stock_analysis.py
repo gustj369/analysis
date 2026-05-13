@@ -59,8 +59,8 @@ REFERENCE_PRICE_DIFF_PCT     = 1.0    # 외부 기준 가격 차이 경계 (1%)
 
 # ── 시각화 상수 ──────────────────────────────────────────────────────────────
 CHART_ROW_HEIGHTS   = (0.34, 0.12, 0.16, 0.16, 0.22)
-CHART_MARGIN_BOTH   = 145   # 대시보드 요약 어노테이션
-CHART_MARGIN_ONE    = 120   # 대시보드 요약 어노테이션
+CHART_MARGIN_BOTH   = 135   # 대시보드 요약 어노테이션
+CHART_MARGIN_ONE    = 110   # 대시보드 요약 어노테이션
 CHART_MARGIN_NONE   = 90    # 어노테이션 없음
 MA_COLORS = {
     "MA5":   "#FFA726",   # 주황
@@ -99,14 +99,16 @@ except ImportError:
     _plotly_ok = False
 
 
-def _check_deps(need_plotly: bool = True, need_fdr: bool = False) -> None:
+def _check_deps(need_plotly: bool = True,
+                need_fdr: bool = False,
+                need_yfinance: bool = True) -> None:
     """
     실행 시점에 필수 의존성을 확인한다.
     import 시점이 아닌 실제 사용 직전에 호출해 에러를 늦춤으로써
     계산 함수만 import 해 테스트하는 경우를 허용한다.
     """
     missing: list[str] = []
-    if not _yfinance_ok:
+    if need_yfinance and not _yfinance_ok:
         missing.append("yfinance")
     if need_plotly and not _plotly_ok:
         missing.append("plotly")
@@ -253,7 +255,9 @@ def is_korean_ticker(ticker: str) -> bool:
 
 
 def fetch_data(ticker: str, period_years: float = DEFAULT_PERIOD_YEARS,
-               start: str = None, end: str = None) -> pd.DataFrame:
+               start: str = None, end: str = None,
+               debug_source: bool = False,
+               debug_columns_dir: str | Path | None = None) -> pd.DataFrame:
     """
     주가 데이터를 수집하여 DataFrame 반환.
 
@@ -295,7 +299,9 @@ def fetch_data(ticker: str, period_years: float = DEFAULT_PERIOD_YEARS,
             raise ImportError("FinanceDataReader 미설치. pip install finance-datareader")
         df = _fetch_korean(ticker, start, end)
     else:
-        df = _fetch_global(ticker, start, end)
+        df = _fetch_global(ticker, start, end,
+                           debug_source=debug_source,
+                           debug_columns_dir=debug_columns_dir)
 
     if df is None or df.empty:
         raise ValueError(f"'{ticker}' 에 대한 데이터를 가져올 수 없습니다. 티커를 확인하세요.")
@@ -333,7 +339,29 @@ def _fetch_korean(ticker: str, start: str, end: str) -> pd.DataFrame:
         raise ValueError(f"한국 주식 데이터 수집 실패 ({ticker}): {e}")
 
 
-def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
+def _format_columns_sample(columns, limit: int = 6) -> str:
+    """디버그 로그용 컬럼 샘플 문자열."""
+    return ", ".join(str(col) for col in list(columns)[:limit])
+
+
+def _save_debug_columns(ticker: str,
+                        columns,
+                        output_dir: str | Path) -> Path:
+    """Save full raw source columns for yfinance debugging."""
+    safe_ticker = re.sub(r"[^A-Za-z0-9_.-]+", "_", ticker).strip("_") or "ticker"
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_ticker}_yfinance_columns.txt"
+    lines = [str(col) for col in list(columns)]
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
+
+
+def _fetch_global(ticker: str,
+                  start: str,
+                  end: str,
+                  debug_source: bool = False,
+                  debug_columns_dir: str | Path | None = None) -> pd.DataFrame:
     """
     yfinance 로 글로벌 주식 수집.
 
@@ -347,8 +375,21 @@ def _fetch_global(ticker: str, start: str, end: str) -> pd.DataFrame:
         if raw.empty:
             raise ValueError(f"yfinance: '{ticker}' 데이터 없음")
 
+        if debug_source:
+            column_type = type(raw.columns).__name__
+            print(f"[데이터 원천] {ticker} yfinance columns={column_type} "
+                  f"sample=[{_format_columns_sample(raw.columns)}]")
+
+        if debug_columns_dir is not None:
+            out_path = _save_debug_columns(ticker, raw.columns, debug_columns_dir)
+            print(f"[데이터 원천] {ticker} full raw columns saved: {out_path}")
+
         raw = _flatten_yfinance_columns(raw, ticker)
         raw = raw.loc[:, ~raw.columns.duplicated(keep="first")]
+
+        if debug_source:
+            print(f"[데이터 원천] {ticker} normalized columns="
+                  f"[{_format_columns_sample(raw.columns)}]")
 
         return raw
     except ValueError:
@@ -583,6 +624,13 @@ def print_external_price_check(ticker: str, df: pd.DataFrame) -> dict:
 # 2단계. 수익률 / 리스크 지표 계산
 # ──────────────────────────────────────────────
 
+def _print_data_validation_reports(ticker: str, df: pd.DataFrame) -> tuple[dict, dict]:
+    """Print data validation reports and return their result dictionaries."""
+    data_quality         = print_data_quality_check(ticker, df)
+    external_price_check = print_external_price_check(ticker, df)
+    return data_quality, external_price_check
+
+
 def compute_returns(df: pd.DataFrame,
                     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
                     annualization_days: int = 252) -> dict:
@@ -662,14 +710,23 @@ def _fetch_one_benchmark(benchmark: str,
                          target_cum: pd.Series,
                          target_daily: pd.Series,
                          target_total_return: float,
-                         debug: bool = False) -> dict:
+                         debug: bool = False,
+                         debug_source: bool = False,
+                         debug_columns_dir: str | Path | None = None) -> dict:
     """
     단일 벤치마크 데이터 수집 + 통계 계산 (ThreadPoolExecutor 내 실행용).
 
     [FIX 1차 B-5] rolling_corr.dropna() 이중 계산 → 단일 변수로 통합
     """
     try:
-        bm_df    = fetch_data(benchmark, start=start, end=end)
+        if debug_source or debug_columns_dir is not None:
+            bm_df = fetch_data(
+                benchmark, start=start, end=end,
+                debug_source=debug_source,
+                debug_columns_dir=debug_columns_dir,
+            )
+        else:
+            bm_df = fetch_data(benchmark, start=start, end=end)
         first_close = float(bm_df["Close"].iloc[0])
         last_close  = float(bm_df["Close"].iloc[-1])
         if debug:
@@ -745,7 +802,9 @@ def compute_benchmark_comparison(target_stats: dict,
                                   annualization_days: int = 252,
                                   benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS,
                                   corr_window: int = 60,
-                                  debug: bool = False) -> list[dict]:
+                                  debug: bool = False,
+                                  debug_source: bool = False,
+                                  debug_columns_dir: str | Path | None = None) -> list[dict]:
     """
     대상 종목 수익률 지표를 시장 벤치마크와 비교한다.
 
@@ -771,6 +830,8 @@ def compute_benchmark_comparison(target_stats: dict,
         target_daily=target_daily,
         target_total_return=target_total_return,
         debug=debug,
+        debug_source=debug_source,
+        debug_columns_dir=debug_columns_dir,
     )
 
     rows = [_fetch_one_benchmark(bm, **kwargs) for bm in benchmarks]
@@ -1306,8 +1367,8 @@ def plot_dashboard(df: pd.DataFrame,
                    benchmark_comparison: list[dict] | None = None,
                    show_excess_return: bool = True,
                    benchmark_display: str = "cumulative",
-                   show_marker_legend: bool = True,
-                   show_signal_markers: bool = True,
+                   show_marker_legend: bool = False,
+                   show_signal_markers: bool = False,
                    strategy_summary: dict | None = None,
                    data_quality: dict | None = None,
                    show_benchmark_legend: bool = False):
@@ -1353,10 +1414,7 @@ def plot_dashboard(df: pd.DataFrame,
     top_margin = CHART_MARGIN_ONE if dashboard_summary else CHART_MARGIN_NONE
 
     fig.update_layout(
-        title=dict(
-            text=f"<b>{ticker} 주식 분석 대시보드</b>",
-            font=dict(size=15),
-        ),
+        title=None,
         height=1120,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
@@ -1366,7 +1424,7 @@ def plot_dashboard(df: pd.DataFrame,
             y=1.005,
             xanchor="right",
             x=1,
-            font=dict(size=11),
+            font=dict(size=10),
         ),
         hovermode="x unified",
         margin=dict(l=60, r=40, t=top_margin, b=40),
@@ -1382,7 +1440,7 @@ def plot_dashboard(df: pd.DataFrame,
     if dashboard_summary:
         fig.add_annotation(
             text=dashboard_summary,
-            xref="paper", yref="paper", x=0, y=1.045,
+            xref="paper", yref="paper", x=0, y=1.035,
             xanchor="left", yanchor="bottom", showarrow=False, align="left",
             font=dict(size=12.5, color="#F5F5F5"),
             bgcolor="rgba(20,24,31,0.78)",
@@ -1396,6 +1454,20 @@ def plot_dashboard(df: pd.DataFrame,
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
     return fig
+
+
+def _save_and_show_dashboard(fig,
+                             ticker: str,
+                             overwrite_html: bool,
+                             output_dir: str | Path) -> Path:
+    """Save the Plotly dashboard HTML, show it, and return the saved path."""
+    out_path = _make_html_path(ticker,
+                               overwrite=overwrite_html,
+                               output_dir=output_dir)
+    fig.write_html(out_path)
+    print(f"[차트 저장] {out_path}")
+    fig.show()
+    return out_path
 
 
 # ──────────────────────────────────────────────
@@ -1643,6 +1715,145 @@ def summarize_strategy_comparison(bt_result: dict, bah_result: dict) -> dict:
     }
 
 
+def _print_analysis_reports(bt_result: dict, bah_result: dict, ticker: str) -> None:
+    """Print final analysis reports after calculations and optional chart output."""
+    print_backtest_report(bt_result, bah_result, ticker)
+
+
+def _print_intermediate_analysis_reports(ticker: str,
+                                         current_state: dict | None = None,
+                                         stats: dict | None = None,
+                                         benchmark_comparison: list[dict] | None = None) -> None:
+    """Print intermediate console reports while preserving the existing order."""
+    if current_state is not None:
+        print_current_state(current_state, ticker)
+    if stats is not None and benchmark_comparison is not None:
+        print_benchmark_report(ticker, stats, benchmark_comparison)
+
+
+def _print_annualization_basis(annualization_days: int) -> None:
+    """Print the detected annualization basis."""
+    print(f"[연환산 기준] {annualization_days}일 "
+          f"({'암호화폐·24/7' if annualization_days == 365 else '주식·평일 거래'})")
+
+
+def _print_indicator_calculation_done() -> None:
+    """Print the technical indicator calculation completion message."""
+    print("[지표 계산 완료] MA(5/20/60/120), RSI(14), MACD(12/26/9)")
+
+
+def _make_cli_report_hooks() -> dict:
+    """Return report hooks used by the CLI-style run_analysis flow."""
+    return {
+        "data_validation": _print_data_validation_reports,
+        "annualization": _print_annualization_basis,
+        "indicators": _print_indicator_calculation_done,
+        "current_state": lambda ticker, summary: _print_intermediate_analysis_reports(
+            ticker, current_state=summary
+        ),
+        "benchmark": lambda ticker, stats, rows: _print_intermediate_analysis_reports(
+            ticker, stats=stats, benchmark_comparison=rows
+        ),
+    }
+
+
+def _build_analysis_result(ticker: str,
+                           period_years: float,
+                           start: str | None,
+                           end: str | None,
+                           initial_capital: float,
+                           commission: float,
+                           risk_free_rate: float,
+                           benchmarks: tuple[str, ...] | None,
+                           benchmark_preset: str,
+                           corr_window: int,
+                           debug_benchmarks: bool,
+                           debug_data_source: bool,
+                           save_debug_columns: bool,
+                           output_dir: str | Path,
+                           report_hooks: dict | None = None) -> dict:
+    """
+    Build the analysis result dictionary from data collection and calculations.
+
+    This function owns fetching data, computing metrics, indicators, benchmarks,
+    and backtest results. User-facing side effects such as saving/showing the
+    dashboard HTML and printing the final report stay in run_analysis().
+    Optional report hooks are only used to preserve the existing CLI output order.
+    """
+    hooks = report_hooks or {}
+
+    df = fetch_data(ticker, period_years=period_years, start=start, end=end)
+
+    data_validation_hook = hooks.get("data_validation")
+    if data_validation_hook is not None:
+        data_quality, external_price_check = data_validation_hook(ticker, df)
+    else:
+        data_quality         = _compute_data_quality_stats(ticker, df)
+        external_price_check = _compute_external_price_stats(ticker, df)
+
+    ann_days = _detect_annualization_days(df)
+    annualization_hook = hooks.get("annualization")
+    if annualization_hook is not None:
+        annualization_hook(ann_days)
+
+    stats = compute_returns(df, risk_free_rate=risk_free_rate,
+                            annualization_days=ann_days)
+
+    df = add_indicators(df)
+    indicators_hook = hooks.get("indicators")
+    if indicators_hook is not None:
+        indicators_hook()
+
+    current_state = summarize_current_state(df)
+    current_state_hook = hooks.get("current_state")
+    if current_state_hook is not None:
+        current_state_hook(ticker, current_state)
+
+    selected_benchmarks = _select_benchmarks(ticker, benchmarks, benchmark_preset)
+    benchmark_start = df.index[0].strftime("%Y-%m-%d")
+    benchmark_end   = (df.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
+    benchmark_comparison = compute_benchmark_comparison(
+        stats,
+        start=benchmark_start,
+        end=benchmark_end,
+        risk_free_rate=risk_free_rate,
+        annualization_days=ann_days,
+        benchmarks=selected_benchmarks,
+        corr_window=corr_window,
+        debug=debug_benchmarks,
+        debug_source=debug_data_source,
+        debug_columns_dir=output_dir if save_debug_columns else None,
+    )
+    benchmark_hook = hooks.get("benchmark")
+    if benchmark_hook is not None:
+        benchmark_hook(ticker, stats, benchmark_comparison)
+
+    bt_result  = backtest_golden_cross(df,
+                                        initial_capital=initial_capital,
+                                        commission=commission,
+                                        risk_free_rate=risk_free_rate,
+                                        annualization_days=ann_days)
+    bah_result = backtest_buy_and_hold(df,
+                                        initial_capital=initial_capital,
+                                        commission=commission,
+                                        risk_free_rate=risk_free_rate,
+                                        annualization_days=ann_days)
+    strategy_summary = summarize_strategy_comparison(bt_result, bah_result)
+
+    return {
+        "df":                   df,
+        "stats":                stats,
+        "bt_result":            bt_result,
+        "bah_result":           bah_result,
+        "annualization_days":   ann_days,
+        "current_state":        current_state,
+        "benchmark_comparison": benchmark_comparison,
+        "strategy_summary":     strategy_summary,
+        "data_quality":         data_quality,
+        "external_price_check": external_price_check,
+    }
+
+
 # ──────────────────────────────────────────────
 # 분석 파이프라인 통합
 # ──────────────────────────────────────────────
@@ -1665,7 +1876,9 @@ def run_analysis(ticker: str,
                  show_marker_legend: bool = True,
                  show_signal_markers: bool = True,
                  show_benchmark_legend: bool = False,
-                 debug_benchmarks: bool = False) -> dict:
+                 debug_benchmarks: bool = False,
+                 debug_data_source: bool = False,
+                 save_debug_columns: bool = False) -> dict:
     """
     전체 분석 파이프라인 실행.
 
@@ -1689,6 +1902,7 @@ def run_analysis(ticker: str,
     show_signal_markers: 시그널 마커 표시 여부
     show_benchmark_legend: 벤치마크 라인 범례 표시 여부
     debug_benchmarks : 벤치마크 첫/마지막 종가 검증 로그 표시 여부
+    debug_data_source: yfinance 원본 컬럼 샘플 로그 표시 여부
 
     Returns
     -------
@@ -1717,62 +1931,39 @@ def run_analysis(ticker: str,
     # 0-c. 의존성 확인 (정규화된 ticker 기준)
     # [FIX 1차 B-2] 원본 ticker 로 is_korean_ticker 호출하던 문제 해결
     _check_deps(need_plotly=show_chart,
-                need_fdr=is_korean_ticker(ticker))
+                need_fdr=is_korean_ticker(ticker),
+                need_yfinance=not is_korean_ticker(ticker))
 
     print(f"\n{'='*55}")
     print(f"  주식 분석 시스템 시작 | 티커: {ticker}")
     print(f"{'='*55}")
 
-    # 1. 데이터 수집
-    df = fetch_data(ticker, period_years=period_years, start=start, end=end)
-    data_quality         = print_data_quality_check(ticker, df)
-    external_price_check = print_external_price_check(ticker, df)
-
-    # 2. 자산 유형별 연환산 기준 자동 결정
-    ann_days = _detect_annualization_days(df)
-    print(f"[연환산 기준] {ann_days}일 "
-          f"({'암호화폐·24/7' if ann_days == 365 else '주식·평일 거래'})")
-
-    # 3. 수익률/리스크 지표
-    stats = compute_returns(df, risk_free_rate=risk_free_rate,
-                             annualization_days=ann_days)
-
-    # 4. 기술적 지표
-    df = add_indicators(df)
-    print(f"[지표 계산 완료] MA(5/20/60/120), RSI(14), MACD(12/26/9)")
-
-    # 5. 현재 상태 요약
-    current_state = summarize_current_state(df)
-    print_current_state(current_state, ticker)
-
-    # 6. 벤치마크 비교 (병렬 fetch)
-    selected_benchmarks = _select_benchmarks(ticker, benchmarks, benchmark_preset)
-    benchmark_start = df.index[0].strftime("%Y-%m-%d")
-    benchmark_end   = (df.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
-    benchmark_comparison = compute_benchmark_comparison(
-        stats,
-        start=benchmark_start,
-        end=benchmark_end,
+    result = _build_analysis_result(
+        ticker=ticker,
+        period_years=period_years,
+        start=start,
+        end=end,
+        initial_capital=initial_capital,
+        commission=commission,
         risk_free_rate=risk_free_rate,
-        annualization_days=ann_days,
-        benchmarks=selected_benchmarks,
+        benchmarks=benchmarks,
+        benchmark_preset=benchmark_preset,
         corr_window=corr_window,
-        debug=debug_benchmarks,
+        debug_benchmarks=debug_benchmarks,
+        debug_data_source=debug_data_source,
+        save_debug_columns=save_debug_columns,
+        output_dir=output_dir,
+        report_hooks=_make_cli_report_hooks(),
     )
-    print_benchmark_report(ticker, stats, benchmark_comparison)
 
-    # 7. 백테스팅
-    bt_result  = backtest_golden_cross(df,
-                                        initial_capital=initial_capital,
-                                        commission=commission,
-                                        risk_free_rate=risk_free_rate,
-                                        annualization_days=ann_days)
-    bah_result = backtest_buy_and_hold(df,
-                                        initial_capital=initial_capital,
-                                        commission=commission,
-                                        risk_free_rate=risk_free_rate,
-                                        annualization_days=ann_days)
-    strategy_summary = summarize_strategy_comparison(bt_result, bah_result)
+    df                   = result["df"]
+    stats                = result["stats"]
+    bt_result            = result["bt_result"]
+    bah_result           = result["bah_result"]
+    current_state        = result["current_state"]
+    benchmark_comparison = result["benchmark_comparison"]
+    strategy_summary     = result["strategy_summary"]
+    data_quality         = result["data_quality"]
 
     # 8. 시각화
     if show_chart:
@@ -1786,27 +1977,11 @@ def run_analysis(ticker: str,
                                    strategy_summary=strategy_summary,
                                    data_quality=data_quality,
                                    show_benchmark_legend=show_benchmark_legend)
-        out_path = _make_html_path(ticker,
-                                   overwrite=overwrite_html,
-                                   output_dir=output_dir)
-        fig.write_html(out_path)
-        print(f"[차트 저장] {out_path}")
-        fig.show()
+        _save_and_show_dashboard(fig, ticker, overwrite_html, output_dir)
 
-    print_backtest_report(bt_result, bah_result, ticker)
+    _print_analysis_reports(bt_result, bah_result, ticker)
 
-    return {
-        "df":                   df,
-        "stats":                stats,
-        "bt_result":            bt_result,
-        "bah_result":           bah_result,
-        "annualization_days":   ann_days,
-        "current_state":        current_state,
-        "benchmark_comparison": benchmark_comparison,
-        "strategy_summary":     strategy_summary,
-        "data_quality":         data_quality,
-        "external_price_check": external_price_check,
-    }
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -1907,7 +2082,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--hide-marker-legend", action="store_true",
-        help="대시보드 범례에서 시그널 마커 항목 숨김",
+        help="대시보드 범례에서 시그널 마커 항목 숨김 (기본값)",
+    )
+    parser.add_argument(
+        "--show-marker-legend", action="store_true",
+        help="대시보드 범례에 RSI/MACD/크로스 보조 마커 항목 표시",
     )
     parser.add_argument(
         "--hide-signal-markers", action="store_true",
@@ -1925,6 +2104,15 @@ def main() -> None:
         "--debug-benchmarks", action="store_true",
         help="벤치마크별 첫/마지막 종가와 행 수를 출력해 중복 데이터 여부 확인",
     )
+    parser.add_argument(
+        "--debug-data-source", action="store_true",
+        help="벤치마크 yfinance 원본/정규화 컬럼 샘플 출력",
+    )
+
+    parser.add_argument(
+        "--save-debug-columns", action="store_true",
+        help="Save full raw yfinance column labels to --output-dir for debugging",
+    )
 
     args = parser.parse_args()
     benchmark_display = args.benchmark_display
@@ -1938,7 +2126,7 @@ def main() -> None:
     else:
         show_signal_markers = args.chart_mode == "full"
 
-    show_marker_legend    = args.chart_mode == "full" and not args.hide_marker_legend
+    show_marker_legend    = args.show_marker_legend and not args.hide_marker_legend
     show_benchmark_legend = args.show_benchmark_legend
 
     try:
@@ -1962,6 +2150,8 @@ def main() -> None:
             show_signal_markers=show_signal_markers,
             show_benchmark_legend=show_benchmark_legend,
             debug_benchmarks=args.debug_benchmarks,
+            debug_data_source=args.debug_data_source or args.save_debug_columns,
+            save_debug_columns=args.save_debug_columns,
         )
     except (ValueError, ImportError) as e:
         print(f"\n[오류] {e}")

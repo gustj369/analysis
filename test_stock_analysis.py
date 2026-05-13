@@ -2,7 +2,8 @@ import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -143,9 +144,11 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             "excess",
             "--corr-window",
             "30",
-            "--hide-marker-legend",
+            "--show-marker-legend",
             "--hide-signal-markers",
             "--show-benchmark-legend",
+            "--debug-data-source",
+            "--save-debug-columns",
         ]
 
         with patch("sys.argv", argv), patch.object(sa, "run_analysis") as run_mock:
@@ -165,9 +168,11 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertFalse(kwargs["show_excess_return"])
         self.assertEqual(kwargs["benchmark_display"], "excess")
         self.assertEqual(kwargs["corr_window"], 30)
-        self.assertFalse(kwargs["show_marker_legend"])
+        self.assertTrue(kwargs["show_marker_legend"])
         self.assertFalse(kwargs["show_signal_markers"])
         self.assertTrue(kwargs["show_benchmark_legend"])
+        self.assertTrue(kwargs["debug_data_source"])
+        self.assertTrue(kwargs["save_debug_columns"])
 
     def test_full_chart_mode_keeps_benchmark_legend_hidden_by_default(self):
         argv = ["stock_analysis.py", "AAPL", "--chart-mode", "full", "--no-chart"]
@@ -177,30 +182,183 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
 
         kwargs = run_mock.call_args.kwargs
         self.assertEqual(kwargs["benchmark_display"], "all")
-        self.assertTrue(kwargs["show_marker_legend"])
+        self.assertFalse(kwargs["show_marker_legend"])
         self.assertTrue(kwargs["show_signal_markers"])
         self.assertFalse(kwargs["show_benchmark_legend"])
+
+    def test_korean_analysis_does_not_require_yfinance_dependency(self):
+        with patch.object(sa, "_yfinance_ok", False), patch.object(
+            sa, "_fdr_ok", True
+        ), patch.object(sa, "_plotly_ok", True):
+            sa._check_deps(
+                need_plotly=False,
+                need_fdr=True,
+                need_yfinance=False,
+            )
 
     def test_run_analysis_includes_current_state_summary(self):
         df = self._sample_price_frame()
 
         with patch.object(sa, "fetch_data", return_value=df), patch.object(
             sa, "_check_deps"
-        ), patch.object(sa, "print_benchmark_report"), patch.object(
-            sa, "print_backtest_report"
+        ), patch.object(sa, "_print_intermediate_analysis_reports"), patch.object(
+            sa, "_print_analysis_reports"
         ), patch(
             "sys.stdout", new_callable=StringIO
         ):
             result = sa.run_analysis("TEST", show_chart=False)
 
-        self.assertIn("current_state", result)
-        self.assertIn("benchmark_comparison", result)
-        self.assertIn("strategy_summary", result)
-        self.assertIn("data_quality", result)
-        self.assertIn("external_price_check", result)
+        expected_keys = {
+            "df",
+            "stats",
+            "bt_result",
+            "bah_result",
+            "annualization_days",
+            "current_state",
+            "benchmark_comparison",
+            "strategy_summary",
+            "data_quality",
+            "external_price_check",
+        }
+        self.assertEqual(set(result), expected_keys)
         self.assertEqual(result["current_state"]["trend"], "상승 우위")
         self.assertEqual(result["current_state"]["signal_score_max"], 5)
         self.assertEqual([row["ticker"] for row in result["benchmark_comparison"]], ["SPY", "QQQ"])
+
+    def test_run_analysis_delegates_dashboard_save_and_show(self):
+        df = self._sample_price_frame()
+        fig = Mock()
+
+        with patch.object(sa, "fetch_data", return_value=df), patch.object(
+            sa, "_check_deps"
+        ), patch.object(sa, "_print_intermediate_analysis_reports"), patch.object(
+            sa, "_print_analysis_reports"
+        ), patch.object(sa, "plot_dashboard", return_value=fig) as plot_mock, patch.object(
+            sa, "_save_and_show_dashboard", return_value=Path("TEST_dashboard.html")
+        ) as save_mock, patch(
+            "sys.stdout", new_callable=StringIO
+        ):
+            result = sa.run_analysis(
+                "TEST",
+                show_chart=True,
+                overwrite_html=True,
+                output_dir="reports",
+            )
+
+        plot_mock.assert_called_once()
+        save_mock.assert_called_once_with(fig, "TEST", True, "reports")
+        self.assertIn("df", result)
+
+    def test_run_analysis_delegates_data_validation_reports(self):
+        df = self._sample_price_frame()
+        data_quality = {"checked": False, "reason": "not_korean_ticker"}
+        external_price_check = {"checked": False, "reason": "not_korean_ticker"}
+
+        with patch.object(sa, "fetch_data", return_value=df), patch.object(
+            sa, "_check_deps"
+        ), patch.object(
+            sa,
+            "_print_data_validation_reports",
+            return_value=(data_quality, external_price_check),
+        ) as validation_mock, patch.object(
+            sa, "_print_intermediate_analysis_reports"
+        ), patch.object(
+            sa, "_print_analysis_reports"
+        ), patch(
+            "sys.stdout", new_callable=StringIO
+        ):
+            result = sa.run_analysis("TEST", show_chart=False)
+
+        validation_mock.assert_called_once_with("TEST", df)
+        self.assertIs(result["data_quality"], data_quality)
+        self.assertIs(result["external_price_check"], external_price_check)
+
+    def test_build_analysis_result_returns_core_result_without_report_hooks(self):
+        df = self._sample_price_frame()
+
+        with patch.object(sa, "fetch_data", return_value=df), redirect_stdout(StringIO()):
+            result = sa._build_analysis_result(
+                ticker="TEST",
+                period_years=1,
+                start=None,
+                end=None,
+                initial_capital=10_000_000,
+                commission=0.00015,
+                risk_free_rate=0.03,
+                benchmarks=(),
+                benchmark_preset="off",
+                corr_window=60,
+                debug_benchmarks=False,
+                debug_data_source=False,
+                save_debug_columns=False,
+                output_dir=".",
+            )
+
+        self.assertIn("df", result)
+        self.assertIn("stats", result)
+        self.assertIn("bt_result", result)
+        self.assertIn("bah_result", result)
+        self.assertIn("strategy_summary", result)
+        self.assertEqual(result["benchmark_comparison"], [])
+
+    def test_make_cli_report_hooks_contains_expected_steps(self):
+        hooks = sa._make_cli_report_hooks()
+
+        self.assertEqual(
+            set(hooks),
+            {
+                "data_validation",
+                "annualization",
+                "indicators",
+                "current_state",
+                "benchmark",
+            },
+        )
+        self.assertIs(hooks["data_validation"], sa._print_data_validation_reports)
+        self.assertIs(hooks["annualization"], sa._print_annualization_basis)
+        self.assertIs(hooks["indicators"], sa._print_indicator_calculation_done)
+
+    def test_run_analysis_delegates_final_report_printing(self):
+        df = self._sample_price_frame()
+
+        with patch.object(sa, "fetch_data", return_value=df), patch.object(
+            sa, "_check_deps"
+        ), patch.object(sa, "_print_intermediate_analysis_reports"), patch.object(
+            sa, "_print_analysis_reports"
+        ) as report_mock, patch(
+            "sys.stdout", new_callable=StringIO
+        ):
+            result = sa.run_analysis("TEST", show_chart=False)
+
+        report_mock.assert_called_once_with(
+            result["bt_result"], result["bah_result"], "TEST"
+        )
+
+    def test_run_analysis_delegates_intermediate_report_printing(self):
+        df = self._sample_price_frame()
+
+        with patch.object(sa, "fetch_data", return_value=df), patch.object(
+            sa, "_check_deps"
+        ), patch.object(
+            sa, "_print_intermediate_analysis_reports"
+        ) as report_mock, patch.object(
+            sa, "_print_analysis_reports"
+        ), patch(
+            "sys.stdout", new_callable=StringIO
+        ):
+            result = sa.run_analysis("TEST", show_chart=False)
+
+        self.assertEqual(report_mock.call_count, 2)
+        first_call = report_mock.call_args_list[0]
+        second_call = report_mock.call_args_list[1]
+        self.assertEqual(first_call.args, ("TEST",))
+        self.assertEqual(first_call.kwargs["current_state"], result["current_state"])
+        self.assertEqual(second_call.args, ("TEST",))
+        self.assertEqual(second_call.kwargs["stats"], result["stats"])
+        self.assertEqual(
+            second_call.kwargs["benchmark_comparison"],
+            result["benchmark_comparison"],
+        )
 
     def test_compute_benchmark_comparison_reports_excess_return(self):
         target_df = self._sample_price_frame(close=np.array([100.0, 120.0]))
@@ -278,6 +436,33 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertIn("벤치마크 검증", stdout.getvalue())
         self.assertIn("벤치마크 경고", stdout.getvalue())
 
+    def test_compute_benchmark_debug_source_uses_single_fetch_path(self):
+        target_df = self._sample_price_frame(close=np.array([100.0, 130.0]))
+        benchmark_df = self._sample_price_frame(close=np.array([100.0, 110.0]))
+        target_stats = sa.compute_returns(target_df, risk_free_rate=0.0, annualization_days=252)
+
+        with patch.object(sa, "_fetch_global") as raw_fetch_mock, patch.object(
+            sa, "fetch_data", return_value=benchmark_df
+        ) as fetch_mock:
+            rows = sa.compute_benchmark_comparison(
+                target_stats,
+                start="2024-01-01",
+                end="2024-01-03",
+                benchmarks=("SPY",),
+                debug_source=True,
+                debug_columns_dir="debug",
+            )
+
+        raw_fetch_mock.assert_not_called()
+        fetch_mock.assert_called_once_with(
+            "SPY",
+            start="2024-01-01",
+            end="2024-01-03",
+            debug_source=True,
+            debug_columns_dir="debug",
+        )
+        self.assertEqual(rows[0]["ticker"], "SPY")
+
     def test_flatten_yfinance_columns_selects_ohlcv_level(self):
         columns = pd.MultiIndex.from_product(
             [["AAPL"], ["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
@@ -290,6 +475,59 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             list(flattened.columns),
             ["Open", "High", "Low", "Close", "Adj Close", "Volume"],
         )
+
+    def test_fetch_global_debug_source_prints_column_samples(self):
+        raw = self._sample_price_frame(close=np.array([100.0, 110.0]))
+        fake_yf = Mock()
+        fake_yf.download.return_value = raw
+
+        stdout = StringIO()
+        with patch.object(sa, "yf", fake_yf), redirect_stdout(stdout):
+            result = sa._fetch_global(
+                "SPY",
+                start="2024-01-01",
+                end="2024-01-03",
+                debug_source=True,
+            )
+
+        self.assertEqual(list(result.columns), ["Open", "High", "Low", "Close", "Volume", "Adj Close"])
+        self.assertIn("데이터 원천", stdout.getvalue())
+        self.assertIn("normalized columns", stdout.getvalue())
+
+    def test_fetch_global_can_save_full_raw_columns(self):
+        fields = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        ticker = "TEST-SAVE"
+        columns = pd.MultiIndex.from_tuples([(ticker, field) for field in fields])
+        raw = pd.DataFrame(
+            [[100.0, 101.0, 99.0, 100.5, 100.5, 1000]],
+            index=pd.date_range("2024-01-01", periods=1, freq="B"),
+            columns=columns,
+        )
+        fake_yf = Mock()
+        fake_yf.download.return_value = raw
+        out_path = Path("TEST-SAVE_yfinance_columns.txt")
+        if out_path.exists():
+            out_path.unlink()
+
+        try:
+            stdout = StringIO()
+            with patch.object(sa, "yf", fake_yf), redirect_stdout(stdout):
+                result = sa._fetch_global(
+                    ticker,
+                    start="2024-01-01",
+                    end="2024-01-03",
+                    debug_source=True,
+                    debug_columns_dir=".",
+                )
+
+            self.assertTrue(out_path.exists())
+            content = out_path.read_text(encoding="utf-8")
+            self.assertIn("('TEST-SAVE', 'Open')", content)
+            self.assertIn("full raw columns saved", stdout.getvalue())
+            self.assertEqual(list(result.columns), fields)
+        finally:
+            if out_path.exists():
+                out_path.unlink()
 
     def test_compute_benchmark_comparison_keeps_fetch_errors(self):
         target_df = self._sample_price_frame(close=np.array([100.0, 120.0]))
@@ -485,6 +723,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         self.assertNotEqual(cm.exception.code, 0)
         self.assertIn("invalid float value", stderr.getvalue())
 
+    # Optional: requires Plotly, so lightweight environments can still run pure logic tests.
     @unittest.skipUnless(sa._plotly_ok, "plotly is not installed")
     def test_plot_dashboard_returns_plotly_figure(self):
         df = sa.add_indicators(self._sample_price_frame())
@@ -526,7 +765,8 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         )
 
         self.assertEqual(fig.layout.height, 1120)
-        self.assertEqual(fig.layout.margin.t, 120)
+        self.assertEqual(fig.layout.margin.t, 110)
+        self.assertEqual(fig.layout.legend.font.size, 10)
         self.assertGreaterEqual(len(fig.data), 10)
         self.assertTrue(fig.layout.annotations)
         self.assertGreaterEqual(len(fig.layout.annotations), 2)
@@ -581,6 +821,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
             current_state=current_state,
             benchmark_comparison=benchmark_comparison,
             show_marker_legend=False,
+            show_signal_markers=True,
             strategy_summary=strategy_summary,
         )
         marker_names = {"골든크로스", "데드크로스", "RSI 매수", "RSI 매도", "MACD 골든", "MACD 데드"}
@@ -600,6 +841,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         marker_traces = [trace for trace in fig_without_signal_markers.data if trace.name in marker_names]
         self.assertEqual(marker_traces, [])
 
+    # Optional: requires live network access and yfinance, so it is off by default.
     @unittest.skipUnless(
         os.getenv("RUN_NETWORK_TESTS") == "1",
         "set RUN_NETWORK_TESTS=1 to run external data tests",

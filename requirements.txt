@@ -1,12 +1,8 @@
 # Stock Analysis System dependencies
-# Install: pip install -r requirements.txt
+# Install: python -m pip install -r requirements.txt
 #
-# [FIX 2차 A-1] Python 버전 요구사항 명시
-#   - X | Y union 타입, list[dict] 소문자 제네릭 → Python 3.10+ 필요
-#   - Python 3.14 권장 (CLAUDE.md 기준)
-#   - Python 3.10 미만 환경에서는 TypeError 발생
-
-# Python >= 3.10 required
+# Python 3.10+ is required because the code uses modern type syntax
+# such as X | Y unions and built-in generic types like list[dict].
 
 yfinance>=0.2.0
 finance-datareader>=0.9.50

@@ -11,6 +11,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+tmp*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -26,6 +27,8 @@ env/
 
 # Generated dashboard outputs can be recreated from stock_analysis.py
 *_dashboard.html
+*_yfinance_columns.txt
+debug/
 
 # OS/editor files
 .DS_Store
