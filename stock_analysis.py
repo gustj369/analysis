@@ -14,6 +14,7 @@ import argparse
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TypedDict
 
 # ── 서드파티 (항상 사용) ─────────────────────────────────────────────────────
 import numpy as np
@@ -59,8 +60,8 @@ REFERENCE_PRICE_DIFF_PCT     = 1.0    # 외부 기준 가격 차이 경계 (1%)
 
 # ── 시각화 상수 ──────────────────────────────────────────────────────────────
 CHART_ROW_HEIGHTS   = (0.34, 0.12, 0.16, 0.16, 0.22)
-CHART_MARGIN_BOTH   = 135   # 대시보드 요약 어노테이션
-CHART_MARGIN_ONE    = 110   # 대시보드 요약 어노테이션
+CHART_MARGIN_LARGE  = 135   # 어노테이션 3줄 이상 (summary + 2개 섹션 이상)
+CHART_MARGIN_MED    = 110   # 어노테이션 1~2줄
 CHART_MARGIN_NONE   = 90    # 어노테이션 없음
 MA_COLORS = {
     "MA5":   "#FFA726",   # 주황
@@ -222,6 +223,14 @@ def _select_benchmarks(ticker: str,
     return tuple(item for item in selected if item != normalized)
 
 
+def _resolve_output_dir(output_dir: str | Path) -> Path:
+    """경로 순회(".." 컴포넌트) 포함 시 ValueError 발생 후 절대 경로 반환."""
+    resolved = Path(output_dir).resolve()
+    if ".." in Path(output_dir).parts:
+        raise ValueError(f"output_dir 에 경로 순회 문자('..')가 포함돼 있습니다: {output_dir!r}")
+    return resolved
+
+
 def _make_html_path(ticker: str,
                     overwrite: bool = False,
                     output_dir: str | Path = ".") -> Path:
@@ -240,7 +249,7 @@ def _make_html_path(ticker: str,
     else:
         ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"{safe}_{ts}_dashboard.html"
-    out = Path(output_dir)
+    out = _resolve_output_dir(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     return out / fname
 
@@ -349,7 +358,7 @@ def _save_debug_columns(ticker: str,
                         output_dir: str | Path) -> Path:
     """Save full raw source columns for yfinance debugging."""
     safe_ticker = re.sub(r"[^A-Za-z0-9_.-]+", "_", ticker).strip("_") or "ticker"
-    out_dir = Path(output_dir)
+    out_dir = _resolve_output_dir(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{safe_ticker}_yfinance_columns.txt"
     lines = [str(col) for col in list(columns)]
@@ -424,24 +433,26 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     [FIX 2차 B-4] 동일 표준 이름으로 여러 컬럼이 매핑될 때 중복 감지·경고
     """
+    # 정확한 이름만 허용 — 부분 문자열 매칭은 "inflow"→Low 같은 오매핑을 유발할 수 있음
+    _exact: dict[str, str] = {
+        "open":   "Open",
+        "high":   "High",
+        "low":    "Low",
+        "close":  "Close",
+        "volume": "Volume",
+        "vol":    "Volume",
+    }
+
     rename_map: dict = {}
     seen_targets: set[str] = set()
 
     for col in df.columns:
         col_lower = str(col).lower().strip().replace(" ", "_")
-        # 'adj' + 'close' 를 'close' 단독보다 먼저 체크
+        # 'adj' + 'close' 를 먼저 체크 (수정종가 변형명이 다양해 부분 문자열 방식 유지)
         if "adj" in col_lower and "close" in col_lower:
             target = "Adj Close"
-        elif "open" in col_lower:
-            target = "Open"
-        elif "high" in col_lower:
-            target = "High"
-        elif "low" in col_lower:
-            target = "Low"
-        elif "close" in col_lower:
-            target = "Close"
-        elif "volume" in col_lower or col_lower in ("vol",):
-            target = "Volume"
+        elif col_lower in _exact:
+            target = _exact[col_lower]
         else:
             continue
 
@@ -555,8 +566,8 @@ def _compute_external_price_stats(ticker: str, df: pd.DataFrame) -> dict:
     if not _yfinance_ok:
         return {"checked": False, "reason": "yfinance_not_installed"}
 
-    start = df.index[max(len(df) - 10, 0)].strftime("%Y-%m-%d")
-    end   = (df.index[-1] + timedelta(days=2)).strftime("%Y-%m-%d")
+    start = df.index[max(len(df) - 10, 0)].strftime("%Y-%m-%d")  # 최근 10거래일 기준 비교
+    end   = (df.index[-1] + timedelta(days=2)).strftime("%Y-%m-%d")  # yfinance end 는 exclusive — 주말·반환 범위 편차 대비 2일 여유
     reference_df     = None
     reference_ticker = None
     failures: dict   = {}
@@ -883,7 +894,10 @@ def print_benchmark_report(ticker: str,
 # ──────────────────────────────────────────────
 
 def compute_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
-    """5/20/60/120일 이동평균선 및 골든/데드 크로스 시그널 추가."""
+    """5/20/60/120일 이동평균선 및 골든/데드 크로스 시그널 추가.
+
+    입력 df 를 직접 수정(in-place)하고 반환한다. 원본을 보호하려면 add_indicators() 를 사용하라.
+    """
     close = df["Close"]
     df["MA5"]   = close.rolling(window=5,   min_periods=5).mean()
     df["MA20"]  = close.rolling(window=20,  min_periods=20).mean()
@@ -891,8 +905,10 @@ def compute_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     df["MA120"] = close.rolling(window=120, min_periods=120).mean()
 
     # NaN 구간에서는 비교가 False → 시그널 없음 (의도된 동작)
-    cond_golden = (df["MA20"] > df["MA60"]) & (df["MA20"].shift(1) <= df["MA60"].shift(1))
-    cond_dead   = (df["MA20"] < df["MA60"]) & (df["MA20"].shift(1) >= df["MA60"].shift(1))
+    ma20_prev   = df["MA20"].shift(1)
+    ma60_prev   = df["MA60"].shift(1)
+    cond_golden = (df["MA20"] > df["MA60"]) & (ma20_prev <= ma60_prev)
+    cond_dead   = (df["MA20"] < df["MA60"]) & (ma20_prev >= ma60_prev)
     df["MA_Signal"] = np.where(cond_golden, "golden", np.where(cond_dead, "dead", ""))
     return df
 
@@ -908,6 +924,8 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
       avg_gain = 0, avg_loss = 0 → RSI = 50  (flat, 중립)
       avg_gain = 0, avg_loss > 0 → RSI = 0   (하락만 존재, 정상 공식)
       NaN (워밍업 미완료)         → RSI = NaN
+
+    입력 df 를 직접 수정(in-place)하고 반환한다. 원본을 보호하려면 add_indicators() 를 사용하라.
     """
     delta    = df["Close"].diff()
     gain     = delta.clip(lower=0)
@@ -947,6 +965,8 @@ def compute_macd(df: pd.DataFrame,
     Note: adjust=False EMA 특성상 초기(slow 기간 이전) 값은 수렴이 덜 됨.
           워밍업 구간에 대한 별도 NaN 처리는 수행하지 않음 (거래 시그널에는
           min_periods 가 없어 미미한 영향이지만 극초기 구간 해석 주의).
+
+    입력 df 를 직접 수정(in-place)하고 반환한다. 원본을 보호하려면 add_indicators() 를 사용하라.
     """
     ema_fast    = df["Close"].ewm(span=fast,   adjust=False).mean()
     ema_slow    = df["Close"].ewm(span=slow,   adjust=False).mean()
@@ -1215,7 +1235,7 @@ def _add_volume_panel(fig, df: pd.DataFrame) -> None:
     """
     vol_colors = np.where(
         df["Close"].values >= df["Open"].values, "#EF5350", "#26A69A"
-    )
+    ).tolist()
     fig.add_trace(go.Bar(
         x=df.index, y=df["Volume"], name="거래량",
         marker_color=vol_colors, opacity=0.7,
@@ -1282,7 +1302,7 @@ def _add_macd_panel(fig,
 
     hist_colors = np.where(
         df["MACD_Hist"].fillna(0).values >= 0, "#EF5350", "#26A69A"
-    )
+    ).tolist()
     fig.add_trace(go.Bar(
         x=df.index, y=df["MACD_Hist"], name="히스토그램",
         marker_color=hist_colors, opacity=0.6,
@@ -1410,8 +1430,13 @@ def plot_dashboard(df: pd.DataFrame,
     dashboard_summary = _format_dashboard_summary_annotation(
         current_state, stats, benchmark_comparison, strategy_summary, data_quality
     )
-    # [FIX 2차 A-3] 인라인 매직 넘버 → CHART_MARGIN_* 상수
-    top_margin = CHART_MARGIN_ONE if dashboard_summary else CHART_MARGIN_NONE
+    # 어노테이션 줄 수(<br> 개수 + 1)에 따라 margin 결정
+    if not dashboard_summary:
+        top_margin = CHART_MARGIN_NONE
+    elif dashboard_summary.count("<br>") >= 2:
+        top_margin = CHART_MARGIN_LARGE
+    else:
+        top_margin = CHART_MARGIN_MED
 
     fig.update_layout(
         title=None,
@@ -1561,8 +1586,9 @@ def backtest_golden_cross(df: pd.DataFrame,
 
     buy_trades  = [t for t in trades if t["type"] == "buy"]
     sell_trades = [t for t in trades if "sell" in t["type"]]
+    # 수수료 차감 기준: 가격 차이 × 주수가 매수·매도 수수료 합산을 초과해야 실제 이익
     wins     = sum(1 for b, s in zip(buy_trades, sell_trades)
-                   if s["price"] > b["price"])
+                   if (s["price"] - b["price"]) * b["shares"] > b["fee"] + s["fee"])
     n_trades = len(sell_trades)
     win_rate = wins / n_trades if n_trades > 0 else 0.0
 
@@ -1654,7 +1680,7 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str) -> Non
     print(f"  샤프 비율         : {bt_result['sharpe']:>15.3f}")
     print(f"  최대 낙폭 (MDD)   : {bt_result['mdd']*100:>14.2f} %")
     print(f"  총 거래 횟수      : {bt_result['n_trades']:>15} 회")
-    print(f"  승률 (가격 기준)  : {bt_result['win_rate']*100:>14.1f} %")
+    print(f"  승률 (수수료 차감): {bt_result['win_rate']*100:>14.1f} %")
 
     print(f"\n[ Buy & Hold 전략 ]")
     print(sep)
@@ -1669,15 +1695,11 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str) -> Non
     # 비교 요약
     print(f"\n[ 전략 비교 요약 ]")
     print(sep)
-    diff_ret    = bt_result['total_return'] - bah_result['total_return']
-    diff_sharpe = bt_result['sharpe']       - bah_result['sharpe']
-    diff_mdd    = bt_result['mdd']          - bah_result['mdd']
-    print(f"  수익률 차이       : {diff_ret*100:>+14.2f} %")
-    print(f"  샤프 비율 차이    : {diff_sharpe:>+15.3f}")
-    print(f"  MDD 차이          : {diff_mdd*100:>+14.2f} %")
-    winner = ("골든크로스 전략" if bt_result['total_return'] > bah_result['total_return']
-              else "Buy & Hold 전략")
-    print(f"\n  > 이 기간 우위 전략: {winner}")
+    summary = summarize_strategy_comparison(bt_result, bah_result)
+    print(f"  수익률 차이       : {summary['return_diff']*100:>+14.2f} %")
+    print(f"  샤프 비율 차이    : {summary['sharpe_diff']:>+15.3f}")
+    print(f"  MDD 차이          : {summary['mdd_diff']*100:>+14.2f} %")
+    print(f"\n  > 이 기간 우위 전략: {summary['winner']}")
 
     # 개별 거래 내역 (매수/매도 페어 + 손익)
     trades      = bt_result.get("trades", [])
@@ -1693,8 +1715,10 @@ def print_backtest_report(bt_result: dict, bah_result: dict, ticker: str) -> Non
                       if hasattr(b["date"], "strftime") else str(b["date"])[:10])
             sell_d = (s["date"].strftime("%Y-%m-%d")
                       if hasattr(s["date"], "strftime") else str(s["date"])[:10])
-            net_pnl_pct = (s["price"] - b["price"]) / b["price"] * 100
-            result      = "WIN " if s["price"] > b["price"] else "LOSS"
+            net_profit   = (s["price"] - b["price"]) * b["shares"] - b["fee"] - s["fee"]
+            initial_cost = b["price"] * b["shares"] + b["fee"]
+            net_pnl_pct  = net_profit / initial_cost * 100
+            result       = "WIN " if net_profit > 0 else "LOSS"
             print(f"  {idx:>3}  {buy_d:^12}  {b['price']:>10,.1f}  "
                   f"{sell_d:^12}  {s['price']:>10,.1f}  {net_pnl_pct:>+9.2f}%  {result:^4}")
     print(f"{'='*60}\n")
@@ -1757,6 +1781,19 @@ def _make_cli_report_hooks() -> dict:
     }
 
 
+class _AnalysisResult(TypedDict):
+    df:                   pd.DataFrame
+    stats:                dict
+    bt_result:            dict
+    bah_result:           dict
+    annualization_days:   int
+    current_state:        dict
+    benchmark_comparison: list
+    strategy_summary:     dict
+    data_quality:         dict
+    external_price_check: dict
+
+
 def _build_analysis_result(ticker: str,
                            period_years: float,
                            start: str | None,
@@ -1771,7 +1808,7 @@ def _build_analysis_result(ticker: str,
                            debug_data_source: bool,
                            save_debug_columns: bool,
                            output_dir: str | Path,
-                           report_hooks: dict | None = None) -> dict:
+                           report_hooks: dict | None = None) -> _AnalysisResult:
     """
     Build the analysis result dictionary from data collection and calculations.
 
@@ -1782,7 +1819,9 @@ def _build_analysis_result(ticker: str,
     """
     hooks = report_hooks or {}
 
-    df = fetch_data(ticker, period_years=period_years, start=start, end=end)
+    df = fetch_data(ticker, period_years=period_years, start=start, end=end,
+                    debug_source=debug_data_source,
+                    debug_columns_dir=output_dir if save_debug_columns else None)
 
     data_validation_hook = hooks.get("data_validation")
     if data_validation_hook is not None:
@@ -1873,8 +1912,8 @@ def run_analysis(ticker: str,
                  show_excess_return: bool = True,
                  benchmark_display: str = "cumulative",
                  corr_window: int = 60,
-                 show_marker_legend: bool = True,
-                 show_signal_markers: bool = True,
+                 show_marker_legend: bool = False,
+                 show_signal_markers: bool = False,
                  show_benchmark_legend: bool = False,
                  debug_benchmarks: bool = False,
                  debug_data_source: bool = False,
@@ -1898,8 +1937,8 @@ def run_analysis(ticker: str,
     show_excess_return: 초과수익선 표시 여부
     benchmark_display : 'all'·'cumulative'·'excess'
     corr_window      : 롤링 상관계수 창 (거래일)
-    show_marker_legend: 시그널 마커 범례 표시 여부
-    show_signal_markers: 시그널 마커 표시 여부
+    show_marker_legend: 시그널 마커 범례 표시 여부 (기본: False, CLI clean 모드와 동일)
+    show_signal_markers: 시그널 마커 표시 여부 (기본: False, CLI clean 모드와 동일)
     show_benchmark_legend: 벤치마크 라인 범례 표시 여부
     debug_benchmarks : 벤치마크 첫/마지막 종가 검증 로그 표시 여부
     debug_data_source: yfinance 원본 컬럼 샘플 로그 표시 여부
@@ -2056,7 +2095,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--benchmark-preset",
-        choices=("auto", "us", "korea", "crypto", "off"),
+        choices=("auto", *BENCHMARK_PRESETS, "off"),
         default="auto",
         help="벤치마크 프리셋 (--benchmarks 미지정 시 사용)",
     )

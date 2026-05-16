@@ -11,10 +11,25 @@ import pandas as pd
 import stock_analysis as sa
 
 
+RUN_ANALYSIS_RESULT_KEYS = {
+    "df",
+    "stats",
+    "bt_result",
+    "bah_result",
+    "annualization_days",
+    "current_state",
+    "benchmark_comparison",
+    "strategy_summary",
+    "data_quality",
+    "external_price_check",
+}
+
+
 class StockAnalysisPureLogicTests(unittest.TestCase):
     @staticmethod
     def _sample_price_frame(rows: int = 130,
                             close: np.ndarray | None = None) -> pd.DataFrame:
+        """Create deterministic OHLCV test data with an Adj Close column."""
         dates = pd.date_range("2024-01-01", periods=rows, freq="B")
         if close is None:
             close = np.linspace(100.0, 130.0, rows)
@@ -208,19 +223,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         ):
             result = sa.run_analysis("TEST", show_chart=False)
 
-        expected_keys = {
-            "df",
-            "stats",
-            "bt_result",
-            "bah_result",
-            "annualization_days",
-            "current_state",
-            "benchmark_comparison",
-            "strategy_summary",
-            "data_quality",
-            "external_price_check",
-        }
-        self.assertEqual(set(result), expected_keys)
+        self.assertEqual(set(result), RUN_ANALYSIS_RESULT_KEYS)
         self.assertEqual(result["current_state"]["trend"], "상승 우위")
         self.assertEqual(result["current_state"]["signal_score_max"], 5)
         self.assertEqual([row["ticker"] for row in result["benchmark_comparison"]], ["SPY", "QQQ"])
@@ -765,7 +768,7 @@ class StockAnalysisPureLogicTests(unittest.TestCase):
         )
 
         self.assertEqual(fig.layout.height, 1120)
-        self.assertEqual(fig.layout.margin.t, 110)
+        self.assertEqual(fig.layout.margin.t, 135)  # 5줄 어노테이션 → CHART_MARGIN_LARGE
         self.assertEqual(fig.layout.legend.font.size, 10)
         self.assertGreaterEqual(len(fig.data), 10)
         self.assertTrue(fig.layout.annotations)
